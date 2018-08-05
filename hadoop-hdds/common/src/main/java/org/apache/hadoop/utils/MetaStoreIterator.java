@@ -24,7 +24,7 @@ import java.util.Iterator;
  * Iterator for MetaDataStore DB.
  * @param <T>
  */
-interface MetaStoreIterator<T> extends Iterator<T> {
+public interface MetaStoreIterator<T> extends Iterator<T> {
 
   /**
    * seek to first entry.

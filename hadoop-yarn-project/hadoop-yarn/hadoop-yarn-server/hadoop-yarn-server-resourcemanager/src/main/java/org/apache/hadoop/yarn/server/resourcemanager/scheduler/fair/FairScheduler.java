@@ -33,6 +33,7 @@ import org.apache.hadoop.yarn.api.records.ApplicationId;
 import org.apache.hadoop.yarn.api.records.Container;
 import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
+import org.apache.hadoop.yarn.api.records.NMToken;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.QueueACL;
 import org.apache.hadoop.yarn.api.records.QueueInfo;
@@ -94,6 +95,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.security.RMContainerTokenSe
 import org.apache.hadoop.yarn.util.resource.DefaultResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.DominantResourceCalculator;
 import org.apache.hadoop.yarn.util.resource.ResourceCalculator;
+import org.apache.hadoop.yarn.util.resource.ResourceUtils;
 import org.apache.hadoop.yarn.util.resource.Resources;
 
 import java.io.IOException;
@@ -950,12 +952,15 @@ public class FairScheduler extends
     Resource headroom = application.getHeadroom();
     application.setApplicationHeadroomForMetrics(headroom);
 
+    List<Container> previousAttemptContainers = application
+        .pullPreviousAttemptContainers();
+    List<NMToken> updatedNMTokens = application.pullUpdatedNMTokens();
     return new Allocation(newlyAllocatedContainers, headroom,
         preemptionContainerIds, null, null,
-        application.pullUpdatedNMTokens(), null, null,
+        updatedNMTokens, null, null,
         application.pullNewlyPromotedContainers(),
         application.pullNewlyDemotedContainers(),
-        application.pullPreviousAttemptContainers());
+        previousAttemptContainers);
   }
 
   private List<MaxResourceValidationResult> validateResourceRequests(
@@ -1417,7 +1422,7 @@ public class FairScheduler extends
       }
 
       if (continuousSchedulingEnabled) {
-        // Contiuous scheduling is deprecated log it on startup
+        // Continuous scheduling is deprecated log it on startup
         LOG.warn("Continuous scheduling is turned ON. It is deprecated " +
             "because it can cause scheduler slowness due to locking issues. " +
             "Schedulers should use assignmultiple as a replacement.");
@@ -1529,6 +1534,12 @@ public class FairScheduler extends
       super.reinitialize(conf, rmContext);
     } catch (Exception e) {
       LOG.error("Failed to reload allocations file", e);
+    }
+    try {
+      refreshMaximumAllocation(
+          ResourceUtils.fetchMaximumAllocationFromConfig(conf));
+    } catch (Exception e) {
+      LOG.error("Failed to refresh maximum allocation", e);
     }
   }
 
