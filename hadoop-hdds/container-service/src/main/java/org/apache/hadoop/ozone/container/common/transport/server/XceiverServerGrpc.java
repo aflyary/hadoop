@@ -22,28 +22,47 @@ import com.google.common.base.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
+    .ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.protocol.proto
+        .StorageContainerDatanodeProtocolProtos.PipelineReport;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
+import org.apache.hadoop.hdds.scm.container.common.helpers.
+    StorageContainerException;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
+import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.container.common.interfaces.ContainerDispatcher;
-import org.apache.ratis.shaded.io.grpc.Server;
-import org.apache.ratis.shaded.io.grpc.ServerBuilder;
-import org.apache.ratis.shaded.io.grpc.netty.NettyServerBuilder;
+
+import org.apache.ratis.thirdparty.io.grpc.BindableService;
+import org.apache.ratis.thirdparty.io.grpc.Server;
+import org.apache.ratis.thirdparty.io.grpc.ServerBuilder;
+import org.apache.ratis.thirdparty.io.grpc.ServerInterceptors;
+import org.apache.ratis.thirdparty.io.grpc.netty.GrpcSslContexts;
+import org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder;
+import org.apache.ratis.thirdparty.io.netty.handler.ssl.ClientAuth;
+import org.apache.ratis.thirdparty.io.netty.handler.ssl.SslContextBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.SocketAddress;
+import java.util.Collections;
+import java.util.List;
+import java.util.UUID;
 
 /**
  * Creates a Grpc server endpoint that acts as the communication layer for
  * Ozone containers.
  */
-public final class XceiverServerGrpc implements XceiverServerSpi {
+public final class XceiverServerGrpc extends XceiverServer {
   private static final Logger
       LOG = LoggerFactory.getLogger(XceiverServerGrpc.class);
   private int port;
+  private UUID id;
   private Server server;
   private final ContainerDispatcher storageContainer;
 
@@ -53,9 +72,11 @@ public final class XceiverServerGrpc implements XceiverServerSpi {
    * @param conf - Configuration
    */
   public XceiverServerGrpc(DatanodeDetails datanodeDetails, Configuration conf,
-                       ContainerDispatcher dispatcher) {
+      ContainerDispatcher dispatcher, BindableService... additionalServices) {
+    super(conf);
     Preconditions.checkNotNull(conf);
 
+    this.id = datanodeDetails.getUuid();
     this.port = conf.getInt(OzoneConfigKeys.DFS_CONTAINER_IPC_PORT,
         OzoneConfigKeys.DFS_CONTAINER_IPC_PORT_DEFAULT);
     // Get an available port on current node and
@@ -75,10 +96,45 @@ public final class XceiverServerGrpc implements XceiverServerSpi {
     }
     datanodeDetails.setPort(
         DatanodeDetails.newPort(DatanodeDetails.Port.Name.STANDALONE, port));
-    server = ((NettyServerBuilder) ServerBuilder.forPort(port))
-        .maxMessageSize(OzoneConfigKeys.DFS_CONTAINER_CHUNK_MAX_SIZE)
-        .addService(new GrpcXceiverService(dispatcher))
-        .build();
+    NettyServerBuilder nettyServerBuilder =
+        ((NettyServerBuilder) ServerBuilder.forPort(port))
+            .maxInboundMessageSize(OzoneConsts.OZONE_SCM_CHUNK_MAX_SIZE);
+
+    ServerCredentialInterceptor credInterceptor =
+        new ServerCredentialInterceptor(getBlockTokenVerifier());
+    nettyServerBuilder.addService(ServerInterceptors.intercept(
+        new GrpcXceiverService(dispatcher,
+            getSecurityConfig().isBlockTokenEnabled(),
+            getBlockTokenVerifier()), credInterceptor));
+
+
+    for (BindableService service : additionalServices) {
+      nettyServerBuilder.addService(service);
+    }
+
+    if (getSecConfig().isGrpcTlsEnabled()) {
+      File privateKeyFilePath = getSecurityConfig().getServerPrivateKeyFile();
+      File serverCertChainFilePath =
+          getSecurityConfig().getServerCertChainFile();
+      File clientCertChainFilePath =
+          getSecurityConfig().getClientCertChainFile();
+      try {
+        SslContextBuilder sslClientContextBuilder = SslContextBuilder.forServer(
+            serverCertChainFilePath, privateKeyFilePath);
+        if (getSecurityConfig().isGrpcMutualTlsRequired() &&
+            clientCertChainFilePath != null) {
+          // Only needed for mutual TLS
+          sslClientContextBuilder.clientAuth(ClientAuth.REQUIRE);
+          sslClientContextBuilder.trustManager(clientCertChainFilePath);
+        }
+        SslContextBuilder sslContextBuilder = GrpcSslContexts.configure(
+            sslClientContextBuilder, getSecurityConfig().getGrpcSslProvider());
+        nettyServerBuilder.sslContext(sslContextBuilder.build());
+      } catch (Exception ex) {
+        LOG.error("Unable to setup TLS for secure datanode GRPC endpoint.", ex);
+      }
+    }
+    server = nettyServerBuilder.build();
     storageContainer = dispatcher;
   }
 
@@ -108,8 +164,27 @@ public final class XceiverServerGrpc implements XceiverServerSpi {
   }
 
   @Override
-  public void submitRequest(
-      ContainerProtos.ContainerCommandRequestProto request) throws IOException {
-    storageContainer.dispatch(request);
+  public void submitRequest(ContainerCommandRequestProto request,
+      HddsProtos.PipelineID pipelineID) throws IOException {
+    super.submitRequest(request, pipelineID);
+    ContainerProtos.ContainerCommandResponseProto response =
+        storageContainer.dispatch(request, null);
+    if (response.getResult() != ContainerProtos.Result.SUCCESS) {
+      throw new StorageContainerException(response.getMessage(),
+          response.getResult());
+    }
+  }
+
+  @Override
+  public boolean isExist(HddsProtos.PipelineID pipelineId) {
+    return PipelineID.valueOf(id).getProtobuf().equals(pipelineId);
+  }
+
+  @Override
+  public List<PipelineReport> getPipelineReport() {
+    return Collections.singletonList(
+            PipelineReport.newBuilder()
+                    .setPipelineID(PipelineID.valueOf(id).getProtobuf())
+                    .build());
   }
 }

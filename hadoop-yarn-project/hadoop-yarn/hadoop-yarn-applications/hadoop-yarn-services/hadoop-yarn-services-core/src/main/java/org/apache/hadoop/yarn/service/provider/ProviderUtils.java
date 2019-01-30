@@ -167,9 +167,8 @@ public class ProviderUtils implements YarnServiceConstants {
   public static Path initCompInstanceDir(SliderFileSystem fs,
       ContainerLaunchService.ComponentLaunchContext compLaunchContext,
       ComponentInstance instance) {
-    Path compDir = new Path(new Path(fs.getAppDir(), "components"),
-        compLaunchContext.getServiceVersion() + "/" +
-            compLaunchContext.getName());
+    Path compDir = fs.getComponentDir(compLaunchContext.getServiceVersion(),
+        compLaunchContext.getName());
     Path compInstanceDir = new Path(compDir, instance.getCompInstanceName());
     instance.setCompInstanceDir(compInstanceDir);
     return compInstanceDir;
@@ -181,10 +180,15 @@ public class ProviderUtils implements YarnServiceConstants {
       AbstractLauncher launcher, SliderFileSystem fs,
       ContainerLaunchService.ComponentLaunchContext compLaunchContext,
       Map<String, String> tokensForSubstitution, ComponentInstance instance,
-      ServiceContext context) throws IOException {
+      ServiceContext context, ProviderService.ResolvedLaunchParams
+      resolvedParams)
+      throws IOException {
+
     Path compInstanceDir = initCompInstanceDir(fs, compLaunchContext, instance);
     if (!fs.getFileSystem().exists(compInstanceDir)) {
-      log.info(instance.getCompInstanceId() + ": Creating dir on hdfs: " + compInstanceDir);
+      log.info("{} version {} : Creating dir on hdfs: {}",
+          instance.getCompInstanceId(), compLaunchContext.getServiceVersion(),
+          compInstanceDir);
       fs.getFileSystem().mkdirs(compInstanceDir,
           new FsPermission(FsAction.ALL, FsAction.NONE, FsAction.NONE));
     } else {
@@ -253,13 +257,15 @@ public class ProviderUtils implements YarnServiceConstants {
           fs.createAmResource(remoteFile, LocalResourceType.FILE);
       Path destFile = new Path(configFile.getDestFile());
       String symlink = APP_CONF_DIR + "/" + fileName;
-      addLocalResource(launcher, symlink, configResource, destFile);
+      addLocalResource(launcher, symlink, configResource, destFile,
+          resolvedParams);
     }
   }
 
   public static synchronized void handleStaticFilesForLocalization(
       AbstractLauncher launcher, SliderFileSystem fs, ContainerLaunchService
-      .ComponentLaunchContext componentLaunchCtx)
+      .ComponentLaunchContext componentLaunchCtx,
+      ProviderService.ResolvedLaunchParams resolvedParams)
       throws IOException {
     for (ConfigFile staticFile :
         componentLaunchCtx.getConfiguration().getFiles()) {
@@ -297,13 +303,14 @@ public class ProviderUtils implements YarnServiceConstants {
           .isEmpty()) {
         destFile = new Path(staticFile.getDestFile());
       }
-
-      addLocalResource(launcher, destFile.getName(), localResource, destFile);
+      addLocalResource(launcher, destFile.getName(), localResource, destFile,
+          resolvedParams);
     }
   }
 
   private static void addLocalResource(AbstractLauncher launcher,
-      String symlink, LocalResource localResource, Path destFile) {
+      String symlink, LocalResource localResource, Path destFile,
+      ProviderService.ResolvedLaunchParams resolvedParams) {
     if (destFile.isAbsolute()) {
       launcher.addLocalResource(symlink, localResource, destFile.toString());
       log.info("Added file for localization: "+ symlink +" -> " +
@@ -314,6 +321,7 @@ public class ProviderUtils implements YarnServiceConstants {
       log.info("Added file for localization: " + symlink+ " -> " +
           localResource.getResource().getFile());
     }
+    resolvedParams.addResolvedRsrcPath(symlink, destFile.toString());
   }
 
   // Static file is files uploaded by users before launch the service. Which

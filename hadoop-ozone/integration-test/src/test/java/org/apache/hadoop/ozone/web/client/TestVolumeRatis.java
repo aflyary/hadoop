@@ -60,6 +60,7 @@ public class TestVolumeRatis {
   }
 
   @Parameterized.Parameter
+  @SuppressWarnings("visibilitymodifier")
   public Class clientProtocol;
 
   @BeforeClass
@@ -72,11 +73,8 @@ public class TestVolumeRatis {
 
     String path = GenericTestUtils
         .getTempPath(TestVolume.class.getSimpleName());
-    path += conf.getTrimmed(OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT,
-        OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT_DEFAULT);
     FileUtils.deleteDirectory(new File(path));
 
-    conf.set(OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT, path);
     Logger.getLogger("log4j.logger.org.apache.http").setLevel(Level.DEBUG);
 
     cluster = MiniOzoneCluster.newBuilder(conf).setNumDatanodes(3).build();

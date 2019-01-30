@@ -34,6 +34,9 @@ import static org.mockito.Matchers.anyObject;
 import org.mockito.Mockito;
 import static org.mockito.Mockito.when;
 
+/**
+ * Test for the random container placement.
+ */
 public class TestSCMContainerPlacementRandom {
 
   @Test
@@ -51,9 +54,9 @@ public class TestSCMContainerPlacementRandom {
         .thenReturn(new ArrayList<>(datanodes));
 
     when(mockNodeManager.getNodeStat(anyObject()))
-        .thenReturn(new SCMNodeMetric(100l, 0l, 100l));
+        .thenReturn(new SCMNodeMetric(100L, 0L, 100L));
     when(mockNodeManager.getNodeStat(datanodes.get(2)))
-        .thenReturn(new SCMNodeMetric(100l, 90l, 10l));
+        .thenReturn(new SCMNodeMetric(100L, 90L, 10L));
 
     SCMContainerPlacementRandom scmContainerPlacementRandom =
         new SCMContainerPlacementRandom(mockNodeManager, conf);

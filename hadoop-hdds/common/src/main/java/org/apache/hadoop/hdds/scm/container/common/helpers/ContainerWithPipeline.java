@@ -22,12 +22,15 @@ import java.util.Comparator;
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.hadoop.hdds.scm.pipeline.UnknownPipelineStateException;
 
 /**
  * Class wraps ozone container info.
  */
-public class ContainerWithPipeline
-    implements Comparator<ContainerWithPipeline>, Comparable<ContainerWithPipeline> {
+public class ContainerWithPipeline implements Comparator<ContainerWithPipeline>,
+    Comparable<ContainerWithPipeline> {
 
   private final ContainerInfo containerInfo;
   private final Pipeline pipeline;
@@ -45,13 +48,16 @@ public class ContainerWithPipeline
     return pipeline;
   }
 
-  public static ContainerWithPipeline fromProtobuf(HddsProtos.ContainerWithPipeline allocatedContainer) {
+  public static ContainerWithPipeline fromProtobuf(
+      HddsProtos.ContainerWithPipeline allocatedContainer)
+      throws UnknownPipelineStateException {
     return new ContainerWithPipeline(
         ContainerInfo.fromProtobuf(allocatedContainer.getContainerInfo()),
-        Pipeline.getFromProtoBuf(allocatedContainer.getPipeline()));
+        Pipeline.getFromProtobuf(allocatedContainer.getPipeline()));
   }
 
-  public HddsProtos.ContainerWithPipeline getProtobuf() {
+  public HddsProtos.ContainerWithPipeline getProtobuf()
+      throws UnknownPipelineStateException {
     HddsProtos.ContainerWithPipeline.Builder builder =
         HddsProtos.ContainerWithPipeline.newBuilder();
     builder.setContainerInfo(getContainerInfo().getProtobuf())

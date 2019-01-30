@@ -23,24 +23,31 @@ import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
 import com.amazonaws.services.dynamodbv2.document.Item;
 import com.amazonaws.services.dynamodbv2.document.PrimaryKey;
 import com.amazonaws.services.dynamodbv2.document.Table;
+import com.amazonaws.services.dynamodbv2.model.ListTagsOfResourceRequest;
 import com.amazonaws.services.dynamodbv2.model.ProvisionedThroughputDescription;
 import com.amazonaws.services.dynamodbv2.model.ResourceNotFoundException;
 import com.amazonaws.services.dynamodbv2.model.TableDescription;
 
+import com.amazonaws.services.dynamodbv2.model.Tag;
 import com.google.common.collect.Lists;
 import org.apache.commons.collections.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.fs.contract.s3a.S3AContract;
 import org.apache.hadoop.fs.s3a.Constants;
 import org.apache.hadoop.fs.s3a.Tristate;
 
 import org.apache.hadoop.io.IOUtils;
 import org.junit.AfterClass;
+import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -74,6 +81,11 @@ import static org.apache.hadoop.test.LambdaTestUtils.*;
  * A table will be created and shared between the tests,
  */
 public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
+
+  public ITestDynamoDBMetadataStore() {
+    super();
+  }
+
   private static final Logger LOG =
       LoggerFactory.getLogger(ITestDynamoDBMetadataStore.class);
   public static final PrimaryKey
@@ -89,7 +101,7 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
 
   private static DynamoDBMetadataStore ddbmsStatic;
 
-  private static String TEST_DYNAMODB_TABLE_NAME;
+  private static String testDynamoDBTableName;
 
   /**
    * Create a path under the test path provided by
@@ -105,10 +117,10 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
   @Override
   public void setUp() throws Exception {
     Configuration conf = prepareTestConfiguration(new Configuration());
-    assertThatDynamoMetadataStoreImpl(conf);
+    assumeThatDynamoMetadataStoreImpl(conf);
     Assume.assumeTrue("Test DynamoDB table name should be set to run "
-            + "integration tests.", TEST_DYNAMODB_TABLE_NAME != null);
-    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, TEST_DYNAMODB_TABLE_NAME);
+            + "integration tests.", testDynamoDBTableName != null);
+    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, testDynamoDBTableName);
 
     s3AContract = new S3AContract(conf);
     s3AContract.init();
@@ -133,11 +145,30 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
   @BeforeClass
   public static void beforeClassSetup() throws IOException {
     Configuration conf = prepareTestConfiguration(new Configuration());
-    assertThatDynamoMetadataStoreImpl(conf);
-    TEST_DYNAMODB_TABLE_NAME = conf.get(S3GUARD_DDB_TEST_TABLE_NAME_KEY);
-    Assume.assumeTrue("Test DynamoDB table name should be set to run "
-        + "integration tests.", TEST_DYNAMODB_TABLE_NAME != null);
-    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, TEST_DYNAMODB_TABLE_NAME);
+    assumeThatDynamoMetadataStoreImpl(conf);
+    // S3GUARD_DDB_TEST_TABLE_NAME_KEY and S3GUARD_DDB_TABLE_NAME_KEY should
+    // be configured to use this test.
+    testDynamoDBTableName = conf.get(S3GUARD_DDB_TEST_TABLE_NAME_KEY);
+    String dynamoDbTableName = conf.getTrimmed(S3GUARD_DDB_TABLE_NAME_KEY);
+    Assume.assumeTrue("No DynamoDB table name configured", !StringUtils
+            .isEmpty(dynamoDbTableName));
+
+    // We should assert that the table name is configured, so the test should
+    // fail if it's not configured.
+    assertTrue("Test DynamoDB table name '"
+        + S3GUARD_DDB_TEST_TABLE_NAME_KEY + "' should be set to run "
+        + "integration tests.", testDynamoDBTableName != null);
+
+    // We should assert that the test table is not the same as the production
+    // table, as the test table could be modified and destroyed multiple
+    // times during the test.
+    assertTrue("Test DynamoDB table name: '"
+        + S3GUARD_DDB_TEST_TABLE_NAME_KEY + "' and production table name: '"
+        + S3GUARD_DDB_TABLE_NAME_KEY + "' can not be the same.",
+        !conf.get(S3GUARD_DDB_TABLE_NAME_KEY).equals(testDynamoDBTableName));
+
+    // We can use that table in the test if these assertions are valid
+    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, testDynamoDBTableName);
 
     LOG.debug("Creating static ddbms which will be shared between tests.");
     ddbmsStatic = new DynamoDBMetadataStore();
@@ -158,7 +189,7 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
     }
   }
 
-  private static void assertThatDynamoMetadataStoreImpl(Configuration conf){
+  private static void assumeThatDynamoMetadataStoreImpl(Configuration conf){
     Assume.assumeTrue("Test only applies when DynamoDB is used for S3Guard",
         conf.get(Constants.S3_METADATA_STORE_IMPL).equals(
             Constants.S3GUARD_METASTORE_DYNAMO));
@@ -568,8 +599,8 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
   }
 
   @Test
-  public void testProvisionTable() throws IOException {
-    final String tableName = "testProvisionTable";
+  public void testProvisionTable() throws Exception {
+    final String tableName =  "testProvisionTable-" + UUID.randomUUID();
     Configuration conf = getFileSystem().getConf();
     conf.set(S3GUARD_DDB_TABLE_NAME_KEY, tableName);
 
@@ -581,13 +612,18 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
       ddbms.provisionTable(oldProvision.getReadCapacityUnits() * 2,
           oldProvision.getWriteCapacityUnits() * 2);
       ddbms.initTable();
+      // we have to wait until the provisioning settings are applied,
+      // so until the table is ACTIVE again and not in UPDATING
+      ddbms.getTable().waitForActive();
       final ProvisionedThroughputDescription newProvision =
           dynamoDB.getTable(tableName).describe().getProvisionedThroughput();
       LOG.info("Old provision = {}, new provision = {}", oldProvision,
           newProvision);
-      assertEquals(oldProvision.getReadCapacityUnits() * 2,
+      assertEquals("Check newly provisioned table read capacity units.",
+          oldProvision.getReadCapacityUnits() * 2,
           newProvision.getReadCapacityUnits().longValue());
-      assertEquals(oldProvision.getWriteCapacityUnits() * 2,
+      assertEquals("Check newly provisioned table write capacity units.",
+          oldProvision.getWriteCapacityUnits() * 2,
           newProvision.getWriteCapacityUnits().longValue());
       ddbms.destroy();
     }
@@ -619,6 +655,89 @@ public class ITestDynamoDBMetadataStore extends MetadataStoreTestBase {
       }
       ddbms.destroy();
     }
+  }
+
+  @Test
+  public void testTableTagging() throws IOException {
+    final Configuration conf = getFileSystem().getConf();
+
+    // clear all table tagging config before this test
+    conf.getPropsWithPrefix(S3GUARD_DDB_TABLE_TAG).keySet().forEach(
+        propKey -> conf.unset(S3GUARD_DDB_TABLE_TAG + propKey)
+    );
+
+    String tableName = "testTableTagging-" + UUID.randomUUID();
+    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, tableName);
+    conf.set(S3GUARD_DDB_TABLE_CREATE_KEY, "true");
+
+    Map<String, String> tagMap = new HashMap<>();
+    tagMap.put("hello", "dynamo");
+    tagMap.put("tag", "youre it");
+    for (Map.Entry<String, String> tagEntry : tagMap.entrySet()) {
+      conf.set(S3GUARD_DDB_TABLE_TAG + tagEntry.getKey(), tagEntry.getValue());
+    }
+
+    try (DynamoDBMetadataStore ddbms = new DynamoDBMetadataStore()) {
+      ddbms.initialize(conf);
+      assertNotNull(ddbms.getTable());
+      assertEquals(tableName, ddbms.getTable().getTableName());
+      ListTagsOfResourceRequest listTagsOfResourceRequest =
+          new ListTagsOfResourceRequest()
+              .withResourceArn(ddbms.getTable().getDescription().getTableArn());
+      List<Tag> tags = ddbms.getAmazonDynamoDB()
+          .listTagsOfResource(listTagsOfResourceRequest).getTags();
+      assertEquals(tagMap.size(), tags.size());
+      for (Tag tag : tags) {
+        Assert.assertEquals(tagMap.get(tag.getKey()), tag.getValue());
+      }
+    }
+  }
+
+  @Test
+  public void testGetEmptyDirFlagCanSetTrue() throws IOException {
+    boolean authoritativeDirectoryListing = true;
+    testGetEmptyDirFlagCanSetTrueOrUnknown(authoritativeDirectoryListing);
+  }
+
+  @Test
+  public void testGetEmptyDirFlagCanSetUnknown() throws IOException {
+    boolean authoritativeDirectoryListing = false;
+    testGetEmptyDirFlagCanSetTrueOrUnknown(authoritativeDirectoryListing);
+  }
+
+  private void testGetEmptyDirFlagCanSetTrueOrUnknown(boolean auth)
+      throws IOException {
+    // setup
+    final DynamoDBMetadataStore ms = getDynamoMetadataStore();
+    String rootPath = "/testAuthoritativeEmptyDirFlag"+ UUID.randomUUID();
+    String filePath = rootPath + "/file1";
+    final Path dirToPut = fileSystem.makeQualified(new Path(rootPath));
+    final Path fileToPut = fileSystem.makeQualified(new Path(filePath));
+
+    // Create non-auth DirListingMetadata
+    DirListingMetadata dlm =
+        new DirListingMetadata(dirToPut, new ArrayList<>(), auth);
+    if(auth){
+      assertEquals(Tristate.TRUE, dlm.isEmpty());
+    } else {
+      assertEquals(Tristate.UNKNOWN, dlm.isEmpty());
+    }
+    assertEquals(auth, dlm.isAuthoritative());
+
+    // Test with non-authoritative listing, empty dir
+    ms.put(dlm);
+    final PathMetadata pmdResultEmpty = ms.get(dirToPut, true);
+    if(auth){
+      assertEquals(Tristate.TRUE, pmdResultEmpty.isEmptyDirectory());
+    } else {
+      assertEquals(Tristate.UNKNOWN, pmdResultEmpty.isEmptyDirectory());
+    }
+
+    // Test with non-authoritative listing, non-empty dir
+    dlm.put(basicFileStatus(fileToPut, 1, false));
+    ms.put(dlm);
+    final PathMetadata pmdResultNotEmpty = ms.get(dirToPut, true);
+    assertEquals(Tristate.FALSE, pmdResultNotEmpty.isEmptyDirectory());
   }
 
   /**

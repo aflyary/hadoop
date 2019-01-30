@@ -51,8 +51,10 @@ import org.apache.hadoop.fs.s3a.MultipartUtils;
 import org.apache.hadoop.fs.s3a.S3AFileStatus;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.s3a.S3AUtils;
+import org.apache.hadoop.fs.s3a.auth.delegation.S3ADelegationTokens;
 import org.apache.hadoop.fs.s3a.commit.CommitConstants;
 import org.apache.hadoop.fs.shell.CommandFormat;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.GenericOptionsParser;
 import org.apache.hadoop.util.Tool;
@@ -66,6 +68,7 @@ import static org.apache.hadoop.service.launcher.LauncherExitCodes.*;
  * CLI to manage S3Guard Metadata Store.
  */
 public abstract class S3GuardTool extends Configured implements Tool {
+
   private static final Logger LOG = LoggerFactory.getLogger(S3GuardTool.class);
 
   private static final String NAME = "s3guard";
@@ -90,6 +93,9 @@ public abstract class S3GuardTool extends Configured implements Tool {
       "\t" + SetCapacity.NAME + " - " +SetCapacity.PURPOSE + "\n";
   private static final String DATA_IN_S3_IS_PRESERVED
       = "(all data in S3 is preserved)";
+
+  public static final String E_NO_METASTORE_OR_FILESYSTEM
+      = "No metastore or filesystem specified";
 
   abstract public String getUsage();
 
@@ -118,6 +124,7 @@ public abstract class S3GuardTool extends Configured implements Tool {
   public static final String REGION_FLAG = "region";
   public static final String READ_FLAG = "read";
   public static final String WRITE_FLAG = "write";
+  public static final String TAG_FLAG = "tag";
 
   /**
    * Constructor a S3Guard tool with HDFS configuration.
@@ -217,6 +224,45 @@ public abstract class S3GuardTool extends Configured implements Tool {
     format.addOptionWithValue(SECONDS_FLAG);
   }
 
+  protected void checkIfS3BucketIsGuarded(List<String> paths)
+      throws IOException {
+    // be sure that path is provided in params, so there's no IOoBE
+    String s3Path = "";
+    if(!paths.isEmpty()) {
+      s3Path = paths.get(0);
+    }
+
+    // Check if DynamoDB url is set from arguments.
+    String metadataStoreUri = getCommandFormat().getOptValue(META_FLAG);
+    if(metadataStoreUri == null || metadataStoreUri.isEmpty()) {
+      // If not set, check if filesystem is guarded by creating an
+      // S3AFileSystem and check if hasMetadataStore is true
+      try (S3AFileSystem s3AFileSystem = (S3AFileSystem)
+          S3AFileSystem.newInstance(toUri(s3Path), getConf())){
+        Preconditions.checkState(s3AFileSystem.hasMetadataStore(),
+            "The S3 bucket is unguarded. " + getName()
+                + " can not be used on an unguarded bucket.");
+      }
+    }
+  }
+
+  /**
+   * Check if bucket or DDB table name is set.
+   */
+  protected void checkBucketNameOrDDBTableNameProvided(List<String> paths) {
+    String s3Path = null;
+    if(!paths.isEmpty()) {
+      s3Path = paths.get(0);
+    }
+
+    String metadataStoreUri = getCommandFormat().getOptValue(META_FLAG);
+
+    if(metadataStoreUri == null && s3Path == null) {
+      throw invalidArgs("S3 bucket url or DDB table name have to be provided "
+          + "explicitly to use " + getName() + " command.");
+    }
+  }
+
   /**
    * Parse metadata store from command line option or HDFS configuration.
    *
@@ -227,12 +273,8 @@ public abstract class S3GuardTool extends Configured implements Tool {
     if (getStore() != null) {
       return getStore();
     }
-    Configuration conf;
-    if (filesystem == null) {
-      conf = getConf();
-    } else {
-      conf = filesystem.getConf();
-    }
+    final boolean hasFileSystem = filesystem != null;
+    final Configuration conf = hasFileSystem ? filesystem.getConf() : getConf();
     String metaURI = getCommandFormat().getOptValue(META_FLAG);
     if (metaURI != null && !metaURI.isEmpty()) {
       URI uri = URI.create(metaURI);
@@ -254,6 +296,13 @@ public abstract class S3GuardTool extends Configured implements Tool {
             String.format("Metadata store %s is not supported", uri));
       }
     } else {
+      if (!hasFileSystem) {
+        // command didn't declare a metadata store URI or a bucket.
+        // to avoid problems related to picking up a shared table for actions
+        // line init and destroy (HADOOP-15843), this is rejected
+        printHelp(this);
+        throw usageError(E_NO_METASTORE_OR_FILESYSTEM);
+      }
       // CLI does not specify metadata store URI, it uses default metadata store
       // DynamoDB instead.
       setStore(new DynamoDBMetadataStore());
@@ -262,10 +311,10 @@ public abstract class S3GuardTool extends Configured implements Tool {
       }
     }
 
-    if (filesystem == null) {
-      getStore().initialize(conf);
-    } else {
+    if (hasFileSystem) {
       getStore().initialize(filesystem);
+    } else {
+      getStore().initialize(conf);
     }
     LOG.info("Metadata store {} is initialized.", getStore());
     return getStore();
@@ -382,6 +431,7 @@ public abstract class S3GuardTool extends Configured implements Tool {
         "  -" + REGION_FLAG + " REGION - Service region for connections\n" +
         "  -" + READ_FLAG + " UNIT - Provisioned read throughput units\n" +
         "  -" + WRITE_FLAG + " UNIT - Provisioned write through put units\n" +
+        "  -" + TAG_FLAG + " key=value; list of tags to tag dynamo table\n" +
         "\n" +
         "  URLs for Amazon DynamoDB are of the form dynamodb://TABLE_NAME.\n" +
         "  Specifying both the -" + REGION_FLAG + " option and an S3A path\n" +
@@ -393,6 +443,8 @@ public abstract class S3GuardTool extends Configured implements Tool {
       getCommandFormat().addOptionWithValue(READ_FLAG);
       // write capacity.
       getCommandFormat().addOptionWithValue(WRITE_FLAG);
+      // tag
+      getCommandFormat().addOptionWithValue(TAG_FLAG);
     }
 
     @Override
@@ -408,6 +460,12 @@ public abstract class S3GuardTool extends Configured implements Tool {
     @Override
     public int run(String[] args, PrintStream out) throws Exception {
       List<String> paths = parseArgs(args);
+      try {
+        checkBucketNameOrDDBTableNameProvided(paths);
+      } catch (ExitUtil.ExitException e) {
+        errorln(USAGE);
+        throw e;
+      }
 
       String readCap = getCommandFormat().getOptValue(READ_FLAG);
       if (readCap != null && !readCap.isEmpty()) {
@@ -418,6 +476,23 @@ public abstract class S3GuardTool extends Configured implements Tool {
       if (writeCap != null && !writeCap.isEmpty()) {
         int writeCapacity = Integer.parseInt(writeCap);
         getConf().setInt(S3GUARD_DDB_TABLE_CAPACITY_WRITE_KEY, writeCapacity);
+      }
+
+      String tags = getCommandFormat().getOptValue(TAG_FLAG);
+      if (tags != null && !tags.isEmpty()) {
+        String[] stringList = tags.split(";");
+        Map<String, String> tagsKV = new HashMap<>();
+        for(String kv : stringList) {
+          if(kv.isEmpty() || !kv.contains("=")){
+            continue;
+          }
+          String[] kvSplit = kv.split("=");
+          tagsKV.put(kvSplit[0], kvSplit[1]);
+        }
+
+        for (Map.Entry<String, String> kv : tagsKV.entrySet()) {
+          getConf().set(S3GUARD_DDB_TABLE_TAG + kv.getKey(), kv.getValue());
+        }
       }
 
       // Validate parameters.
@@ -479,6 +554,7 @@ public abstract class S3GuardTool extends Configured implements Tool {
     public int run(String[] args, PrintStream out) throws Exception {
       List<String> paths = parseArgs(args);
       Map<String, String> options = new HashMap<>();
+      checkIfS3BucketIsGuarded(paths);
 
       String readCap = getCommandFormat().getOptValue(READ_FLAG);
       if (StringUtils.isNotEmpty(readCap)) {
@@ -549,6 +625,8 @@ public abstract class S3GuardTool extends Configured implements Tool {
     public int run(String[] args, PrintStream out) throws Exception {
       List<String> paths = parseArgs(args);
       try {
+        checkBucketNameOrDDBTableNameProvided(paths);
+        checkIfS3BucketIsGuarded(paths);
         parseDynamoDBRegion(paths);
       } catch (ExitUtil.ExitException e) {
         errorln(USAGE);
@@ -1016,7 +1094,7 @@ public abstract class S3GuardTool extends Configured implements Tool {
         + "\t" + PURPOSE + "\n\n"
         + "Common options:\n"
         + "  -" + GUARDED_FLAG + " - Require S3Guard\n"
-        + "  -" + UNGUARDED_FLAG + " - Require S3Guard to be disabled\n"
+        + "  -" + UNGUARDED_FLAG + " - Force S3Guard to be disabled\n"
         + "  -" + AUTH_FLAG + " - Require the S3Guard mode to be \"authoritative\"\n"
         + "  -" + NONAUTH_FLAG + " - Require the S3Guard mode to be \"non-authoritative\"\n"
         + "  -" + MAGIC_FLAG + " - Require the S3 filesystem to be support the \"magic\" committer\n"
@@ -1047,6 +1125,15 @@ public abstract class S3GuardTool extends Configured implements Tool {
         throw invalidArgs("No bucket specified");
       }
       String s3Path = paths.get(0);
+      CommandFormat commands = getCommandFormat();
+
+      // check if UNGUARDED_FLAG is passed and use NullMetadataStore in
+      // config to avoid side effects like creating the table if not exists
+      if (commands.getOpt(UNGUARDED_FLAG)) {
+        LOG.debug("Unguarded flag is passed to command :" + this.getName());
+        getConf().set(S3_METADATA_STORE_IMPL, S3GUARD_METASTORE_NULL);
+      }
+
       S3AFileSystem fs = (S3AFileSystem) FileSystem.newInstance(
           toUri(s3Path), getConf());
       setFilesystem(fs);
@@ -1083,7 +1170,23 @@ public abstract class S3GuardTool extends Configured implements Tool {
               "none");
       printOption(out, "\tInput seek policy", INPUT_FADVISE, INPUT_FADV_NORMAL);
 
-      CommandFormat commands = getCommandFormat();
+      // look at delegation token support
+      if (fs.getDelegationTokens().isPresent()) {
+        // DT is enabled
+        S3ADelegationTokens dtIntegration = fs.getDelegationTokens().get();
+        println(out, "Delegation Support enabled: token kind = %s",
+            dtIntegration.getTokenKind());
+        UserGroupInformation.AuthenticationMethod authenticationMethod
+            = UserGroupInformation.getCurrentUser().getAuthenticationMethod();
+        println(out, "Hadoop security mode: %s", authenticationMethod);
+        if (UserGroupInformation.isSecurityEnabled()) {
+          println(out,
+              "Warning: security is disabled; tokens will not be collected");
+        }
+      } else {
+        println(out, "Delegation token support is disabled");
+      }
+
       if (usingS3Guard) {
         if (commands.getOpt(UNGUARDED_FLAG)) {
           throw badState("S3Guard is enabled for %s", fsUri);
@@ -1354,13 +1457,13 @@ public abstract class S3GuardTool extends Configured implements Tool {
     return uri;
   }
 
-  private static void printHelp() {
-    if (command == null) {
+  private static void printHelp(S3GuardTool tool) {
+    if (tool == null) {
       errorln("Usage: hadoop " + USAGE);
       errorln("\tperform S3Guard metadata store " +
           "administrative commands.");
     } else {
-      errorln("Usage: hadoop " + command.getUsage());
+      errorln("Usage: hadoop " + tool.getUsage());
     }
     errorln();
     errorln(COMMON_USAGE);
@@ -1399,7 +1502,6 @@ public abstract class S3GuardTool extends Configured implements Tool {
       println(out, "\t%s=%s", entry.getKey(), entry.getValue());
     }
   }
-
 
   /**
    * Handle store not found by converting to an exit exception
@@ -1448,6 +1550,18 @@ public abstract class S3GuardTool extends Configured implements Tool {
     return new ExitUtil.ExitException(ERROR, String.format(format, args));
   }
 
+
+  /**
+   * Build the exception to raise on a usage error
+   * @param format string format
+   * @param args optional arguments for the string
+   * @return a new exception to throw
+   */
+  protected static ExitUtil.ExitException usageError(
+      String format, Object...args) {
+    return new ExitUtil.ExitException(E_USAGE, String.format(format, args));
+  }
+
   /**
    * Execute the command with the given arguments.
    *
@@ -1463,8 +1577,8 @@ public abstract class S3GuardTool extends Configured implements Tool {
     String[] otherArgs = new GenericOptionsParser(conf, args)
         .getRemainingArgs();
     if (otherArgs.length == 0) {
-      printHelp();
-      throw new ExitUtil.ExitException(E_USAGE, "No arguments provided");
+      printHelp(null);
+      throw usageError("No arguments provided");
     }
     final String subCommand = otherArgs[0];
     LOG.debug("Executing command {}", subCommand);
@@ -1494,7 +1608,7 @@ public abstract class S3GuardTool extends Configured implements Tool {
       command = new Uploads(conf);
       break;
     default:
-      printHelp();
+      printHelp(null);
       throw new ExitUtil.ExitException(E_USAGE,
           "Unknown command " + subCommand);
     }
@@ -1511,11 +1625,17 @@ public abstract class S3GuardTool extends Configured implements Tool {
       exit(ret, "");
     } catch (CommandFormat.UnknownOptionException e) {
       errorln(e.getMessage());
-      printHelp();
+      printHelp(command);
       exit(E_USAGE, e.getMessage());
     } catch (ExitUtil.ExitException e) {
       // explicitly raised exit code
       exit(e.getExitCode(), e.toString());
+    } catch (FileNotFoundException e) {
+      // bucket doesn't exist or similar.
+      // skip the stack trace and choose the return code of 44, "404"
+      errorln(e.toString());
+      LOG.debug("Not found:", e);
+      exit(EXIT_NOT_FOUND, e.toString());
     } catch (Throwable e) {
       e.printStackTrace(System.err);
       exit(ERROR, e.toString());

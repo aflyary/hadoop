@@ -208,7 +208,7 @@
             processData: false,
             crossDomain: true
           }).always(function(data) {
-            $('#file-info-preview-body').val(data.responseText);
+            $('#file-info-preview-body').val(data);
             $('#file-info-tail').show();
           }).fail(function(jqXHR, textStatus, errorThrown) {
             show_err_msg("Couldn't preview the file. " + errorThrown);
@@ -404,6 +404,34 @@
        $('#btn-create-directory-send').button('reset');
     });
   })
+
+  $('#btn-upload-files').click(function() {
+        $('#modal-upload-file-button').prop('disabled', true).button('reset');
+        $('#modal-upload-file-input').val(null);
+      });
+
+  $('#btn-create-dir').click(function() {
+        $('#btn-create-directory-send').prop('disabled', true).button('reset');
+        $('#new_directory').val(null);
+      });
+
+  $('#modal-upload-file-input').change(function() {
+      if($('#modal-upload-file-input').prop('files').length >0) {
+         $('#modal-upload-file-button').prop('disabled', false);
+        }
+      else {
+        $('#modal-upload-file-button').prop('disabled', true);
+        }
+      });
+
+  $('#new_directory').on('keyup keypress blur change',function() {
+      if($('#new_directory').val() == '' ||  $('#new_directory').val() == null) {
+         $('#btn-create-directory-send').prop('disabled', true);
+        }
+      else {
+         $('#btn-create-directory-send').prop('disabled', false);
+        }
+      });
 
   $('#modal-upload-file-button').click(function() {
     $(this).prop('disabled', true);

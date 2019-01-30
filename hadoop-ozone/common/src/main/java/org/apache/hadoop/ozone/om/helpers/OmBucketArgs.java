@@ -17,21 +17,25 @@
  */
 package org.apache.hadoop.ozone.om.helpers;
 
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
-import com.google.common.base.Preconditions;
-import org.apache.hadoop.fs.StorageType;
-import org.apache.hadoop.hdfs.protocolPB.PBHelperClient;
+import org.apache.hadoop.hdds.protocol.StorageType;
 import org.apache.hadoop.ozone.OzoneAcl;
-import org.apache.hadoop.ozone.protocol.proto
-    .OzoneManagerProtocolProtos.BucketArgs;
+import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.audit.Auditable;
+import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.BucketArgs;
 import org.apache.hadoop.ozone.protocolPB.OMPBHelper;
+
+import com.google.common.base.Preconditions;
 
 /**
  * A class that encapsulates Bucket Arguments.
  */
-public final class OmBucketArgs {
+public final class OmBucketArgs extends WithMetadata implements Auditable {
   /**
    * Name of the volume in which the bucket belongs to.
    */
@@ -69,13 +73,15 @@ public final class OmBucketArgs {
    */
   private OmBucketArgs(String volumeName, String bucketName,
                        List<OzoneAcl> addAcls, List<OzoneAcl> removeAcls,
-                       Boolean isVersionEnabled, StorageType storageType) {
+      Boolean isVersionEnabled, StorageType storageType,
+      Map<String, String> metadata) {
     this.volumeName = volumeName;
     this.bucketName = bucketName;
     this.addAcls = addAcls;
     this.removeAcls = removeAcls;
     this.isVersionEnabled = isVersionEnabled;
     this.storageType = storageType;
+    this.metadata = metadata;
   }
 
   /**
@@ -96,7 +102,7 @@ public final class OmBucketArgs {
 
   /**
    * Returns the ACL's that are to be added.
-   * @return List<OzoneAclInfo>
+   * @return {@literal List<OzoneAclInfo>}
    */
   public List<OzoneAcl> getAddAcls() {
     return addAcls;
@@ -104,7 +110,7 @@ public final class OmBucketArgs {
 
   /**
    * Returns the ACL's that are to be removed.
-   * @return List<OzoneAclInfo>
+   * @return {@literal List<OzoneAclInfo>}
    */
   public List<OzoneAcl> getRemoveAcls() {
     return removeAcls;
@@ -135,6 +141,25 @@ public final class OmBucketArgs {
     return new Builder();
   }
 
+  @Override
+  public Map<String, String> toAuditMap() {
+    Map<String, String> auditMap = new LinkedHashMap<>();
+    auditMap.put(OzoneConsts.VOLUME, this.volumeName);
+    auditMap.put(OzoneConsts.BUCKET, this.bucketName);
+    if(this.addAcls != null){
+      auditMap.put(OzoneConsts.ADD_ACLS, this.addAcls.toString());
+    }
+    if(this.removeAcls != null){
+      auditMap.put(OzoneConsts.REMOVE_ACLS, this.removeAcls.toString());
+    }
+    auditMap.put(OzoneConsts.IS_VERSION_ENABLED,
+                String.valueOf(this.isVersionEnabled));
+    if(this.storageType != null){
+      auditMap.put(OzoneConsts.STORAGE_TYPE, this.storageType.name());
+    }
+    return auditMap;
+  }
+
   /**
    * Builder for OmBucketArgs.
    */
@@ -145,6 +170,7 @@ public final class OmBucketArgs {
     private List<OzoneAcl> removeAcls;
     private Boolean isVersionEnabled;
     private StorageType storageType;
+    private Map<String, String> metadata;
 
     public Builder setVolumeName(String volume) {
       this.volumeName = volume;
@@ -171,6 +197,11 @@ public final class OmBucketArgs {
       return this;
     }
 
+    public Builder addMetadata(Map<String, String> metadataMap) {
+      this.metadata = metadataMap;
+      return this;
+    }
+
     public Builder setStorageType(StorageType storage) {
       this.storageType = storage;
       return this;
@@ -184,7 +215,7 @@ public final class OmBucketArgs {
       Preconditions.checkNotNull(volumeName);
       Preconditions.checkNotNull(bucketName);
       return new OmBucketArgs(volumeName, bucketName, addAcls,
-          removeAcls, isVersionEnabled, storageType);
+          removeAcls, isVersionEnabled, storageType, metadata);
     }
   }
 
@@ -207,8 +238,7 @@ public final class OmBucketArgs {
       builder.setIsVersionEnabled(isVersionEnabled);
     }
     if(storageType != null) {
-      builder.setStorageType(
-          PBHelperClient.convertStorageType(storageType));
+      builder.setStorageType(storageType.toProto());
     }
     return builder.build();
   }
@@ -227,7 +257,8 @@ public final class OmBucketArgs {
             OMPBHelper::convertOzoneAcl).collect(Collectors.toList()),
         bucketArgs.hasIsVersionEnabled() ?
             bucketArgs.getIsVersionEnabled() : null,
-        bucketArgs.hasStorageType() ? PBHelperClient.convertStorageType(
-            bucketArgs.getStorageType()) : null);
+        bucketArgs.hasStorageType() ? StorageType.valueOf(
+            bucketArgs.getStorageType()) : null,
+        KeyValueUtil.getFromProtobuf(bucketArgs.getMetadataList()));
   }
 }

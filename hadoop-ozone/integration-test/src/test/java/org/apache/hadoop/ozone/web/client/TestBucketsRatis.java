@@ -57,11 +57,12 @@ public class TestBucketsRatis {
   }
 
   @Parameterized.Parameter
+  @SuppressWarnings("visibilitymodifier")
   public static Class clientProtocol;
 
   @BeforeClass
   public static void init() throws Exception {
-    suite = new RatisTestHelper.RatisTestSuite(TestBucketsRatis.class);
+    suite = new RatisTestHelper.RatisTestSuite();
     conf = suite.getConf();
   }
 

@@ -17,8 +17,23 @@
 package org.apache.hadoop.hdds.scm;
 
 import com.google.common.base.Preconditions;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.PipelineAction;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ClosePipelineInfo;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.PipelineActionsProto;
 import org.apache.hadoop.hdds.protocol.proto
-    .StorageContainerDatanodeProtocolProtos.ContainerInfo;
+    .StorageContainerDatanodeProtocolProtos.ContainerReplicaProto;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.PipelineReport;
+import org.apache.hadoop.hdds.protocol.proto
+        .StorageContainerDatanodeProtocolProtos.PipelineReportsProto;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
+import org.apache.hadoop.hdds.scm.server.SCMDatanodeHeartbeatDispatcher.PipelineActionsFromDatanode;
+import org.apache.hadoop.hdds.scm.server
+    .SCMDatanodeHeartbeatDispatcher.PipelineReportFromDatanode;
+import org.apache.hadoop.hdds.scm.container.ContainerID;
+import org.apache.hadoop.hdds.scm.container.ContainerManager;
+
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.ContainerReportsProto;
 import org.apache.hadoop.hdds.protocol
@@ -37,6 +52,7 @@ import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.protocol.commands.RegisteredCommand;
 
 import java.io.File;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -74,7 +90,7 @@ public final class TestUtils {
         + "." + random.nextInt(256)
         + "." + random.nextInt(256)
         + "." + random.nextInt(256);
-   return createDatanodeDetails(uuid.toString(), "localhost", ipAddress);
+    return createDatanodeDetails(uuid.toString(), "localhost", ipAddress);
   }
 
   /**
@@ -128,7 +144,8 @@ public final class TestUtils {
   public static DatanodeDetails createRandomDatanodeAndRegister(
       SCMNodeManager nodeManager) {
     return getDatanodeDetails(
-        nodeManager.register(randomDatanodeDetails(), null));
+        nodeManager.register(randomDatanodeDetails(), null,
+                getRandomPipelineReports()));
   }
 
   /**
@@ -259,12 +276,12 @@ public final class TestUtils {
     StorageTypeProto storageTypeProto =
         type == null ? StorageTypeProto.DISK : type;
     srb.setStorageType(storageTypeProto);
-   return srb.build();
+    return srb.build();
   }
 
 
   /**
-   * Generates random container reports
+   * Generates random container reports.
    *
    * @return ContainerReportsProto
    */
@@ -281,11 +298,44 @@ public final class TestUtils {
    */
   public static ContainerReportsProto getRandomContainerReports(
       int numberOfContainers) {
-   List<ContainerInfo> containerInfos = new ArrayList<>();
+    List<ContainerReplicaProto> containerInfos = new ArrayList<>();
     for (int i = 0; i < numberOfContainers; i++) {
       containerInfos.add(getRandomContainerInfo(i));
     }
     return getContainerReports(containerInfos);
+  }
+
+
+  public static PipelineReportsProto getRandomPipelineReports() {
+    return PipelineReportsProto.newBuilder().build();
+  }
+
+  public static PipelineReportFromDatanode getPipelineReportFromDatanode(
+      DatanodeDetails dn, PipelineID... pipelineIDs) {
+    PipelineReportsProto.Builder reportBuilder =
+        PipelineReportsProto.newBuilder();
+    for (PipelineID pipelineID : pipelineIDs) {
+      reportBuilder.addPipelineReport(
+          PipelineReport.newBuilder().setPipelineID(pipelineID.getProtobuf()));
+    }
+    return new PipelineReportFromDatanode(dn, reportBuilder.build());
+  }
+
+  public static PipelineActionsFromDatanode getPipelineActionFromDatanode(
+      DatanodeDetails dn, PipelineID... pipelineIDs) {
+    PipelineActionsProto.Builder actionsProtoBuilder =
+        PipelineActionsProto.newBuilder();
+    for (PipelineID pipelineID : pipelineIDs) {
+      ClosePipelineInfo closePipelineInfo =
+          ClosePipelineInfo.newBuilder().setPipelineID(pipelineID.getProtobuf())
+              .setReason(ClosePipelineInfo.Reason.PIPELINE_FAILED)
+              .setDetailedReason("").build();
+      actionsProtoBuilder.addPipelineActions(PipelineAction.newBuilder()
+          .setClosePipeline(closePipelineInfo)
+          .setAction(PipelineAction.Action.CLOSE)
+          .build());
+    }
+    return new PipelineActionsFromDatanode(dn, actionsProtoBuilder.build());
   }
 
   /**
@@ -296,7 +346,7 @@ public final class TestUtils {
    * @return ContainerReportsProto
    */
   public static ContainerReportsProto getContainerReports(
-      ContainerInfo... containerInfos) {
+      ContainerReplicaProto... containerInfos) {
     return getContainerReports(Arrays.asList(containerInfos));
   }
 
@@ -308,10 +358,10 @@ public final class TestUtils {
    * @return ContainerReportsProto
    */
   public static ContainerReportsProto getContainerReports(
-      List<ContainerInfo> containerInfos) {
+      List<ContainerReplicaProto> containerInfos) {
     ContainerReportsProto.Builder
         reportsBuilder = ContainerReportsProto.newBuilder();
-    for (ContainerInfo containerInfo : containerInfos) {
+    for (ContainerReplicaProto containerInfo : containerInfos) {
       reportsBuilder.addReports(containerInfo);
     }
     return reportsBuilder.build();
@@ -324,7 +374,8 @@ public final class TestUtils {
    *
    * @return ContainerInfo
    */
-  public static ContainerInfo getRandomContainerInfo(long containerId) {
+  public static ContainerReplicaProto getRandomContainerInfo(
+      long containerId) {
     return createContainerInfo(containerId,
         OzoneConsts.GB * 5,
         random.nextLong(1000),
@@ -349,11 +400,13 @@ public final class TestUtils {
    *
    * @return ContainerInfo
    */
-  public static ContainerInfo createContainerInfo(
+  @SuppressWarnings("parameternumber")
+  public static ContainerReplicaProto createContainerInfo(
       long containerId, long size, long keyCount, long bytesUsed,
       long readCount, long readBytes, long writeCount, long writeBytes) {
-    return ContainerInfo.newBuilder()
+    return ContainerReplicaProto.newBuilder()
         .setContainerID(containerId)
+        .setState(ContainerReplicaProto.State.OPEN)
         .setSize(size)
         .setKeyCount(keyCount)
         .setUsed(bytesUsed)
@@ -376,5 +429,21 @@ public final class TestUtils {
     return report.build();
   }
 
+  public static org.apache.hadoop.hdds.scm.container.ContainerInfo
+      allocateContainer(ContainerManager containerManager)
+      throws IOException {
+    return containerManager
+        .allocateContainer(HddsProtos.ReplicationType.STAND_ALONE,
+            HddsProtos.ReplicationFactor.THREE, "root");
 
+  }
+
+  public static void closeContainer(ContainerManager containerManager,
+      ContainerID id) throws IOException {
+    containerManager.updateContainerState(
+        id, HddsProtos.LifeCycleEvent.FINALIZE);
+    containerManager.updateContainerState(
+        id, HddsProtos.LifeCycleEvent.CLOSE);
+
+  }
 }

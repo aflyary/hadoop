@@ -35,6 +35,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
+import org.apache.commons.collections.keyvalue.DefaultMapEntry;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.classification.InterfaceAudience.Private;
@@ -50,6 +51,7 @@ import org.apache.hadoop.yarn.api.records.ContainerState;
 import org.apache.hadoop.yarn.api.records.ContainerStatus;
 import org.apache.hadoop.yarn.api.records.ContainerUpdateType;
 import org.apache.hadoop.yarn.api.records.ExecutionType;
+import org.apache.hadoop.yarn.api.records.NodeAttribute;
 import org.apache.hadoop.yarn.api.records.NodeId;
 import org.apache.hadoop.yarn.api.records.NodeState;
 import org.apache.hadoop.yarn.api.records.Resource;
@@ -58,7 +60,9 @@ import org.apache.hadoop.yarn.api.records.ResourceUtilization;
 import org.apache.hadoop.yarn.event.EventHandler;
 import org.apache.hadoop.yarn.factories.RecordFactory;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
+import org.apache.hadoop.yarn.nodelabels.AttributeValue;
 import org.apache.hadoop.yarn.nodelabels.CommonNodeLabelsManager;
+import org.apache.hadoop.yarn.nodelabels.NodeAttributesManager;
 import org.apache.hadoop.yarn.server.api.protocolrecords.LogAggregationReport;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NMContainerStatus;
 import org.apache.hadoop.yarn.server.api.protocolrecords.NodeHeartbeatResponse;
@@ -173,6 +177,14 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
       new ArrayList<ApplicationId>();
   
   private final Map<ContainerId, Container> toBeUpdatedContainers =
+      new HashMap<>();
+
+  /*
+   * Because the Docker container's Ip, Port Mapping and other properties
+   * are generated after the container is launched, need to update the
+   * container property information to the applications in the RM.
+   */
+  private final Map<ContainerId, ContainerStatus> updatedExistContainers =
       new HashMap<>();
 
   // NOTE: This is required for backward compatibility.
@@ -1368,6 +1380,8 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
         new ArrayList<ContainerStatus>();
     List<ContainerStatus> newlyCompletedContainers =
         new ArrayList<ContainerStatus>();
+    List<Map.Entry<ApplicationId, ContainerStatus>> needUpdateContainers =
+        new ArrayList<Map.Entry<ApplicationId, ContainerStatus>>();
     int numRemoteRunningContainers = 0;
     for (ContainerStatus remoteContainer : containerStatuses) {
       ContainerId containerId = remoteContainer.getContainerId();
@@ -1409,6 +1423,26 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
           containerAllocationExpirer
               .unregister(new AllocationExpirationInfo(containerId));
         }
+
+        // Check if you need to update the exist container status
+        boolean needUpdate = false;
+        if (!updatedExistContainers.containsKey(containerId)) {
+          needUpdate = true;
+        } else {
+          ContainerStatus pContainer = updatedExistContainers.get(containerId);
+          if (null != pContainer) {
+            String preExposedPorts = pContainer.getExposedPorts();
+            if (null != preExposedPorts &&
+                !preExposedPorts.equals(remoteContainer.getExposedPorts())) {
+              needUpdate = true;
+            }
+          }
+        }
+        if (needUpdate) {
+          updatedExistContainers.put(containerId, remoteContainer);
+          needUpdateContainers.add(new DefaultMapEntry(containerAppId,
+              remoteContainer));
+        }
       } else {
         // A finished container
         launchedContainers.remove(containerId);
@@ -1431,9 +1465,10 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
     }
 
     if (newlyLaunchedContainers.size() != 0
-        || newlyCompletedContainers.size() != 0) {
+        || newlyCompletedContainers.size() != 0
+        || needUpdateContainers.size() != 0) {
       nodeUpdateQueue.add(new UpdatedContainerInfo(newlyLaunchedContainers,
-          newlyCompletedContainers));
+          newlyCompletedContainers, needUpdateContainers));
     }
   }
 
@@ -1545,5 +1580,13 @@ public class RMNodeImpl implements RMNode, EventHandler<RMNodeEvent> {
   @Override
   public RMContext getRMContext() {
     return this.context;
+  }
+
+  @Override
+  public Set<NodeAttribute> getAllNodeAttributes() {
+    NodeAttributesManager attrMgr = context.getNodeAttributesManager();
+    Map<NodeAttribute, AttributeValue> nodeattrs =
+        attrMgr.getAttributesForNode(hostName);
+    return nodeattrs.keySet();
   }
 }

@@ -37,8 +37,8 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.classification.InterfaceStability;
 import org.apache.hadoop.conf.Configuration;
@@ -69,6 +69,8 @@ import org.apache.hadoop.hdfs.server.protocol.NamespaceInfo;
 import org.apache.hadoop.hdfs.util.Canceler;
 import org.apache.hadoop.hdfs.util.MD5FileUtils;
 import org.apache.hadoop.io.MD5Hash;
+import org.apache.hadoop.log.LogThrottlingHelper;
+import org.apache.hadoop.log.LogThrottlingHelper.LogAction;
 import org.apache.hadoop.util.ExitUtil;
 import org.apache.hadoop.util.Time;
 
@@ -83,7 +85,8 @@ import com.google.common.collect.Lists;
 @InterfaceAudience.Private
 @InterfaceStability.Evolving
 public class FSImage implements Closeable {
-  public static final Log LOG = LogFactory.getLog(FSImage.class.getName());
+  public static final Logger LOG =
+      LoggerFactory.getLogger(FSImage.class.getName());
 
   protected FSEditLog editLog = null;
   private boolean isUpgradeFinalized = false;
@@ -123,6 +126,11 @@ public class FSImage implements Closeable {
   private final Set<Long> currentlyCheckpointing =
       Collections.<Long>synchronizedSet(new HashSet<Long>());
 
+  /** Limit logging about edit loading to every 5 seconds max. */
+  private static final long LOAD_EDIT_LOG_INTERVAL_MS = 5000;
+  private final LogThrottlingHelper loadEditLogHelper =
+      new LogThrottlingHelper(LOAD_EDIT_LOG_INTERVAL_MS);
+
   /**
    * Construct an FSImage
    * @param conf Configuration
@@ -160,7 +168,8 @@ public class FSImage implements Closeable {
     archivalManager = new NNStorageRetentionManager(conf, storage, editLog);
   }
  
-  void format(FSNamesystem fsn, String clusterId) throws IOException {
+  void format(FSNamesystem fsn, String clusterId, boolean force)
+      throws IOException {
     long fileCount = fsn.getFilesTotal();
     // Expect 1 file, which is the root inode
     Preconditions.checkState(fileCount == 1,
@@ -171,7 +180,7 @@ public class FSImage implements Closeable {
     ns.clusterID = clusterId;
     
     storage.format(ns);
-    editLog.formatNonFileJournals(ns);
+    editLog.formatNonFileJournals(ns, force);
     saveFSImageInAllDirs(fsn, 0);
   }
   
@@ -884,8 +893,16 @@ public class FSImage implements Closeable {
       
       // Load latest edits
       for (EditLogInputStream editIn : editStreams) {
-        LOG.info("Reading " + editIn + " expecting start txid #" +
-              (lastAppliedTxId + 1));
+        LogAction logAction = loadEditLogHelper.record();
+        if (logAction.shouldLog()) {
+          String logSuppressed = "";
+          if (logAction.getCount() > 1) {
+            logSuppressed = "; suppressed logging for " +
+                (logAction.getCount() - 1) + " edit reads";
+          }
+          LOG.info("Reading " + editIn + " expecting start txid #" +
+              (lastAppliedTxId + 1) + logSuppressed);
+        }
         try {
           loader.loadFSEdits(editIn, lastAppliedTxId + 1, maxTxnsToRead,
               startOpt, recovery);
@@ -1135,7 +1152,7 @@ public class FSImage implements Closeable {
     getStorage().updateNameDirSize();
 
     if (exitAfterSave.get()) {
-      LOG.fatal("NameNode process will exit now... The saved FsImage " +
+      LOG.error("NameNode process will exit now... The saved FsImage " +
           nnf + " is potentially corrupted.");
       ExitUtil.terminate(-1);
     }

@@ -17,6 +17,7 @@
  */
 package org.apache.hadoop.hdfs.qjournal.server;
 
+import com.google.protobuf.ByteString;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
@@ -24,22 +25,26 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStreamWriter;
 import java.net.URL;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.security.PrivilegedExceptionAction;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.Range;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileUtil;
+import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.qjournal.protocol.JournalNotFormattedException;
 import org.apache.hadoop.hdfs.qjournal.protocol.JournalOutOfSyncException;
 import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocol;
 import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos;
+import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.GetJournaledEditsResponseProto;
 import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.NewEpochResponseProto;
 import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.PersistedRecoveryPaxosData;
 import org.apache.hadoop.hdfs.qjournal.protocol.QJournalProtocolProtos.PrepareRecoveryResponseProto;
@@ -79,12 +84,13 @@ import com.google.protobuf.TextFormat;
  * the same JVM.
  */
 public class Journal implements Closeable {
-  static final Log LOG = LogFactory.getLog(Journal.class);
+  static final Logger LOG = LoggerFactory.getLogger(Journal.class);
 
 
   // Current writing state
   private EditLogOutputStream curSegment;
   private long curSegmentTxId = HdfsServerConstants.INVALID_TXID;
+  private int curSegmentLayoutVersion = 0;
   private long nextTxId = HdfsServerConstants.INVALID_TXID;
   private long highestWrittenTxId = 0;
   
@@ -133,6 +139,8 @@ public class Journal implements Closeable {
   
   private final FileJournalManager fjm;
 
+  private final JournaledEditsCache cache;
+
   private final JournalMetrics metrics;
 
   private long lastJournalTimestamp = 0;
@@ -156,6 +164,13 @@ public class Journal implements Closeable {
     refreshCachedData();
     
     this.fjm = storage.getJournalManager();
+
+    if (conf.getBoolean(DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,
+        DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_DEFAULT)) {
+      this.cache = new JournaledEditsCache(conf);
+    } else {
+      this.cache = null;
+    }
     
     this.metrics = JournalMetrics.create(this);
     
@@ -227,13 +242,13 @@ public class Journal implements Closeable {
   /**
    * Format the local storage with the given namespace.
    */
-  void format(NamespaceInfo nsInfo) throws IOException {
+  void format(NamespaceInfo nsInfo, boolean force) throws IOException {
     Preconditions.checkState(nsInfo.getNamespaceID() != 0,
         "can't format with uninitialized namespace info: %s",
         nsInfo);
     LOG.info("Formatting journal id : " + journalId + " with namespace info: " +
-        nsInfo);
-    storage.format(nsInfo);
+        nsInfo + " and force: " + force);
+    storage.format(nsInfo, force);
     refreshCachedData();
   }
 
@@ -361,6 +376,7 @@ public class Journal implements Closeable {
     curSegment.abort();
     curSegment = null;
     curSegmentTxId = HdfsServerConstants.INVALID_TXID;
+    curSegmentLayoutVersion = 0;
   }
 
   /**
@@ -405,6 +421,9 @@ public class Journal implements Closeable {
     if (LOG.isTraceEnabled()) {
       LOG.trace("Writing txid " + firstTxnId + "-" + lastTxnId +
           " ; journal id: " + journalId);
+    }
+    if (cache != null) {
+      cache.storeEdits(records, firstTxnId, lastTxnId, curSegmentLayoutVersion);
     }
 
     // If the edit has already been marked as committed, we know
@@ -593,6 +612,7 @@ public class Journal implements Closeable {
     
     curSegment = fjm.startLogSegment(txid, layoutVersion);
     curSegmentTxId = txid;
+    curSegmentLayoutVersion = layoutVersion;
     nextTxId = txid;
   }
   
@@ -612,6 +632,7 @@ public class Journal implements Closeable {
         curSegment.close();
         curSegment = null;
         curSegmentTxId = HdfsServerConstants.INVALID_TXID;
+        curSegmentLayoutVersion = 0;
       }
       
       checkSync(nextTxId == endTxId + 1,
@@ -710,6 +731,44 @@ public class Journal implements Closeable {
     }
 
     return new RemoteEditLogManifest(logs, getCommittedTxnId());
+  }
+
+  /**
+   * @see QJournalProtocol#getJournaledEdits(String, String, long, int)
+   */
+  public GetJournaledEditsResponseProto getJournaledEdits(long sinceTxId,
+      int maxTxns) throws IOException {
+    if (cache == null) {
+      throw new IOException("The journal edits cache is not enabled, which " +
+          "is a requirement to fetch journaled edits via RPC. Please enable " +
+          "it via " + DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY);
+    }
+    if (sinceTxId > getHighestWrittenTxId()) {
+      // Requested edits that don't exist yet; short-circuit the cache here
+      metrics.rpcEmptyResponses.incr();
+      return GetJournaledEditsResponseProto.newBuilder().setTxnCount(0).build();
+    }
+    try {
+      List<ByteBuffer> buffers = new ArrayList<>();
+      int txnCount = cache.retrieveEdits(sinceTxId, maxTxns, buffers);
+      int totalSize = 0;
+      for (ByteBuffer buf : buffers) {
+        totalSize += buf.remaining();
+      }
+      metrics.txnsServedViaRpc.incr(txnCount);
+      metrics.bytesServedViaRpc.incr(totalSize);
+      ByteString.Output output = ByteString.newOutput(totalSize);
+      for (ByteBuffer buf : buffers) {
+        output.write(buf.array(), buf.position(), buf.remaining());
+      }
+      return GetJournaledEditsResponseProto.newBuilder()
+          .setTxnCount(txnCount)
+          .setEditLog(output.toByteString())
+          .build();
+    } catch (JournaledEditsCache.CacheMissException cme) {
+      metrics.rpcRequestCacheMissAmount.add(cme.getCacheMissAmount());
+      throw cme;
+    }
   }
 
   /**
@@ -1045,7 +1104,7 @@ public class Journal implements Closeable {
   public synchronized void doPreUpgrade() throws IOException {
     // Do not hold file lock on committedTxnId, because the containing
     // directory will be renamed.  It will be reopened lazily on next access.
-    IOUtils.cleanup(LOG, committedTxnId);
+    IOUtils.cleanupWithLogger(LOG, committedTxnId);
     storage.getJournalManager().doPreUpgrade();
   }
 
@@ -1087,7 +1146,7 @@ public class Journal implements Closeable {
       lastWriterEpoch.set(prevLastWriterEpoch.get());
       committedTxnId.set(prevCommittedTxnId.get());
     } finally {
-      IOUtils.cleanup(LOG, prevCommittedTxnId);
+      IOUtils.cleanupWithLogger(LOG, prevCommittedTxnId);
     }
   }
 
@@ -1109,7 +1168,7 @@ public class Journal implements Closeable {
   public synchronized void doRollback() throws IOException {
     // Do not hold file lock on committedTxnId, because the containing
     // directory will be renamed.  It will be reopened lazily on next access.
-    IOUtils.cleanup(LOG, committedTxnId);
+    IOUtils.cleanupWithLogger(LOG, committedTxnId);
     storage.getJournalManager().doRollback();
   }
 
@@ -1150,4 +1209,10 @@ public class Journal implements Closeable {
   public Long getJournalCTime() throws IOException {
     return storage.getJournalManager().getJournalCTime();
   }
+
+  @VisibleForTesting
+  JournaledEditsCache getJournaledEditsCache() {
+    return cache;
+  }
+
 }

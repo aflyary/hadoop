@@ -56,7 +56,8 @@ public abstract class AbstractProviderService implements ProviderService,
 
   public abstract void processArtifact(AbstractLauncher launcher,
       ComponentInstance compInstance, SliderFileSystem fileSystem,
-      Service service)
+      Service service,
+      ContainerLaunchService.ComponentLaunchContext compLaunchCtx)
       throws IOException;
 
   public Map<String, String> buildContainerTokens(ComponentInstance instance,
@@ -135,12 +136,14 @@ public abstract class AbstractProviderService implements ProviderService,
     }
   }
 
-  public void buildContainerLaunchContext(AbstractLauncher launcher,
+  public ResolvedLaunchParams buildContainerLaunchContext(
+      AbstractLauncher launcher,
       Service service, ComponentInstance instance,
       SliderFileSystem fileSystem, Configuration yarnConf, Container container,
       ContainerLaunchService.ComponentLaunchContext compLaunchContext)
       throws IOException, SliderException {
-    processArtifact(launcher, instance, fileSystem, service);
+    ResolvedLaunchParams resolved = new ResolvedLaunchParams();
+    processArtifact(launcher, instance, fileSystem, service, compLaunchContext);
 
     ServiceContext context =
         instance.getComponent().getScheduler().getContext();
@@ -153,13 +156,13 @@ public abstract class AbstractProviderService implements ProviderService,
         fileSystem, yarnConf, container, compLaunchContext,
         tokensForSubstitution);
 
-    // create config file on hdfs and add local resource
+    // create config file on hdfs and addResolvedRsrcPath local resource
     ProviderUtils.createConfigFileAndAddLocalResource(launcher, fileSystem,
-        compLaunchContext, tokensForSubstitution, instance, context);
+        compLaunchContext, tokensForSubstitution, instance, context, resolved);
 
     // handles static files (like normal file / archive file) for localization.
     ProviderUtils.handleStaticFilesForLocalization(launcher, fileSystem,
-        compLaunchContext);
+        compLaunchContext, resolved);
 
     // replace launch command with token specific information
     buildContainerLaunchCommand(launcher, service, instance, fileSystem,
@@ -167,5 +170,7 @@ public abstract class AbstractProviderService implements ProviderService,
 
     // Setup container retry settings
     buildContainerRetry(launcher, yarnConf, compLaunchContext, instance);
+
+    return resolved;
   }
 }

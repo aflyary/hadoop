@@ -19,15 +19,20 @@ package org.apache.hadoop.hdds.scm.block;
 
 import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang3.RandomUtils;
-import org.apache.hadoop.hdds.scm.container.ContainerMapping;
-import org.apache.hadoop.hdds.scm.container.Mapping;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerWithPipeline;
-import org.apache.hadoop.hdds.scm.container.common.helpers.Pipeline;
+import org.apache.hadoop.hdds.HddsConfigKeys;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.ContainerReplicaProto;
+import org.apache.hadoop.hdds.scm.container.ContainerID;
+import org.apache.hadoop.hdds.scm.container.ContainerReplica;
+import org.apache.hadoop.hdds.scm.container.SCMContainerManager;
+import org.apache.hadoop.hdds.scm.container.ContainerManager;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
+import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
-import org.apache.hadoop.hdds.protocol.proto.HddsProtos.LifeCycleState;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationFactor;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.ReplicationType;
 import org.apache.hadoop.hdds.protocol.proto
@@ -49,18 +54,19 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static org.apache.hadoop.hdds.scm.ScmConfigKeys
     .OZONE_SCM_BLOCK_DELETION_MAX_RETRY;
-import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_METADATA_DIRS;
-import static org.mockito.Matchers.anyLong;
+import static org.mockito.Matchers.anyObject;
 import static org.mockito.Mockito.when;
 
 /**
@@ -71,7 +77,7 @@ public class TestDeletedBlockLog {
   private static DeletedBlockLogImpl deletedBlockLog;
   private OzoneConfiguration conf;
   private File testDir;
-  private Mapping containerManager;
+  private ContainerManager containerManager;
   private List<DatanodeDetails> dnList;
 
   @Before
@@ -80,8 +86,8 @@ public class TestDeletedBlockLog {
         TestDeletedBlockLog.class.getSimpleName());
     conf = new OzoneConfiguration();
     conf.setInt(OZONE_SCM_BLOCK_DELETION_MAX_RETRY, 20);
-    conf.set(OZONE_METADATA_DIRS, testDir.getAbsolutePath());
-    containerManager = Mockito.mock(ContainerMapping.class);
+    conf.set(HddsConfigKeys.OZONE_METADATA_DIRS, testDir.getAbsolutePath());
+    containerManager = Mockito.mock(SCMContainerManager.class);
     deletedBlockLog = new DeletedBlockLogImpl(conf, containerManager);
     dnList = new ArrayList<>(3);
     setupContainerManager();
@@ -98,19 +104,23 @@ public class TestDeletedBlockLog {
         DatanodeDetails.newBuilder().setUuid(UUID.randomUUID().toString())
             .build());
 
-    ContainerInfo containerInfo =
-        new ContainerInfo.Builder().setContainerID(1).build();
-    Pipeline pipeline =
-        new Pipeline(null, LifeCycleState.CLOSED, ReplicationType.RATIS,
-            ReplicationFactor.THREE, null);
-    pipeline.addMember(dnList.get(0));
-    pipeline.addMember(dnList.get(1));
-    pipeline.addMember(dnList.get(2));
-    ContainerWithPipeline containerWithPipeline =
-        new ContainerWithPipeline(containerInfo, pipeline);
-    when(containerManager.getContainerWithPipeline(anyLong()))
-        .thenReturn(containerWithPipeline);
-    when(containerManager.getContainer(anyLong())).thenReturn(containerInfo);
+    final ContainerInfo container =
+        new ContainerInfo.Builder().setContainerID(1)
+            .setReplicationFactor(ReplicationFactor.THREE)
+            .setState(HddsProtos.LifeCycleState.CLOSED)
+            .build();
+    final Set<ContainerReplica> replicaSet = dnList.stream()
+        .map(datanodeDetails -> ContainerReplica.newBuilder()
+            .setContainerID(container.containerID())
+            .setContainerState(ContainerReplicaProto.State.OPEN)
+            .setDatanodeDetails(datanodeDetails)
+            .build())
+        .collect(Collectors.toSet());
+
+    when(containerManager.getContainerReplicas(anyObject()))
+        .thenReturn(replicaSet);
+    when(containerManager.getContainer(anyObject()))
+        .thenReturn(container);
   }
 
   @After
@@ -378,23 +388,35 @@ public class TestDeletedBlockLog {
     Assert.assertTrue(transactions.isFull());
   }
 
-  private void mockContainerInfo(long containerID, DatanodeDetails dd) throws IOException {
-    Pipeline pipeline =
-        new Pipeline("fake", LifeCycleState.OPEN,
-            ReplicationType.STAND_ALONE, ReplicationFactor.ONE, "fake");
-    pipeline.addMember(dd);
+  private void mockContainerInfo(long containerID, DatanodeDetails dd)
+      throws IOException {
+    List<DatanodeDetails> dns = Collections.singletonList(dd);
+    Pipeline pipeline = Pipeline.newBuilder()
+            .setType(ReplicationType.STAND_ALONE)
+            .setFactor(ReplicationFactor.ONE)
+            .setState(Pipeline.PipelineState.OPEN)
+            .setId(PipelineID.randomId())
+            .setNodes(dns)
+            .build();
 
     ContainerInfo.Builder builder = new ContainerInfo.Builder();
-    builder.setPipelineName(pipeline.getPipelineName())
+    builder.setPipelineID(pipeline.getId())
         .setReplicationType(pipeline.getType())
         .setReplicationFactor(pipeline.getFactor());
 
     ContainerInfo containerInfo = builder.build();
-    ContainerWithPipeline containerWithPipeline = new ContainerWithPipeline(
-        containerInfo, pipeline);
     Mockito.doReturn(containerInfo).when(containerManager)
-        .getContainer(containerID);
-    Mockito.doReturn(containerWithPipeline).when(containerManager)
-        .getContainerWithPipeline(containerID);
+        .getContainer(ContainerID.valueof(containerID));
+
+    final Set<ContainerReplica> replicaSet = dns.stream()
+        .map(datanodeDetails -> ContainerReplica.newBuilder()
+            .setContainerID(containerInfo.containerID())
+            .setContainerState(ContainerReplicaProto.State.OPEN)
+            .setDatanodeDetails(datanodeDetails)
+            .build())
+        .collect(Collectors.toSet());
+    when(containerManager.getContainerReplicas(
+        ContainerID.valueof(containerID)))
+        .thenReturn(replicaSet);
   }
 }

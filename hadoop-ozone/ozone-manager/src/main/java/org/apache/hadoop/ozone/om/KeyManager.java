@@ -16,11 +16,17 @@
  */
 package org.apache.hadoop.ozone.om;
 
+import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.ozone.common.BlockGroup;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyLocationInfo;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartCommitUploadPartInfo;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadCompleteInfo;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadList;
 import org.apache.hadoop.ozone.om.helpers.OpenKeySession;
+import org.apache.hadoop.utils.BackgroundService;
 
 import java.io.IOException;
 import java.util.List;
@@ -32,8 +38,11 @@ public interface KeyManager {
 
   /**
    * Start key manager.
+   *
+   * @param configuration
+   * @throws IOException
    */
-  void start();
+  void start(OzoneConfiguration configuration);
 
   /**
    * Stop key manager.
@@ -49,7 +58,7 @@ public interface KeyManager {
    * @param clientID the client that is committing.
    * @throws IOException
    */
-  void commitKey(OmKeyArgs args, int clientID) throws IOException;
+  void commitKey(OmKeyArgs args, long clientID) throws IOException;
 
   /**
    * A client calls this on an open key, to request to allocate a new block,
@@ -60,7 +69,7 @@ public interface KeyManager {
    * @return the reference to the new block.
    * @throws IOException
    */
-  OmKeyLocationInfo allocateBlock(OmKeyArgs args, int clientID)
+  OmKeyLocationInfo allocateBlock(OmKeyArgs args, long clientID)
       throws IOException;
   /**
    * Given the args of a key to put, write an open key entry to meta data.
@@ -71,7 +80,7 @@ public interface KeyManager {
    *
    * @param args the args of the key provided by client.
    * @return a OpenKeySession instance client uses to talk to container.
-   * @throws Exception
+   * @throws IOException
    */
   OpenKeySession openKey(OmKeyArgs args) throws IOException;
 
@@ -128,7 +137,7 @@ public interface KeyManager {
    * @throws IOException
    */
   List<OmKeyInfo> listKeys(String volumeName,
-                           String bucketName, String startKey, String keyPrefix, int maxKeys)
+      String bucketName, String startKey, String keyPrefix, int maxKeys)
       throws IOException;
 
   /**
@@ -142,16 +151,6 @@ public interface KeyManager {
    * @throws IOException
    */
   List<BlockGroup> getPendingDeletionKeys(int count) throws IOException;
-
-  /**
-   * Deletes a pending deletion key by its name. This is often called when
-   * key can be safely deleted from this layer. Once called, all footprints
-   * of the key will be purged from OM DB.
-   *
-   * @param objectKeyName object key name with #deleting# prefix.
-   * @throws IOException if specified key doesn't exist or other I/O errors.
-   */
-  void deletePendingDeletionKey(String objectKeyName) throws IOException;
 
   /**
    * Returns a list of all still open key info. Which contains the info about
@@ -172,4 +171,53 @@ public interface KeyManager {
    * @throws IOException if specified key doesn't exist or other I/O errors.
    */
   void deleteExpiredOpenKey(String objectKeyName) throws IOException;
+
+  /**
+   * Returns the metadataManager.
+   * @return OMMetadataManager.
+   */
+  OMMetadataManager getMetadataManager();
+
+  /**
+   * Returns the instance of Deleting Service.
+   * @return Background service.
+   */
+  BackgroundService getDeletingService();
+
+
+  /**
+   * Initiate multipart upload for the specified key.
+   * @param keyArgs
+   * @return MultipartInfo
+   * @throws IOException
+   */
+  OmMultipartInfo initiateMultipartUpload(OmKeyArgs keyArgs) throws IOException;
+
+  /**
+   * Commit Multipart upload part file.
+   * @param omKeyArgs
+   * @param clientID
+   * @return OmMultipartCommitUploadPartInfo
+   * @throws IOException
+   */
+
+  OmMultipartCommitUploadPartInfo commitMultipartUploadPart(
+      OmKeyArgs omKeyArgs, long clientID) throws IOException;
+
+  /**
+   * Complete Multipart upload Request.
+   * @param omKeyArgs
+   * @param multipartUploadList
+   * @return OmMultipartUploadCompleteInfo
+   * @throws IOException
+   */
+  OmMultipartUploadCompleteInfo completeMultipartUpload(OmKeyArgs omKeyArgs,
+      OmMultipartUploadList multipartUploadList) throws IOException;
+
+  /**
+   * Abort multipart upload request.
+   * @param omKeyArgs
+   * @throws IOException
+   */
+  void abortMultipartUpload(OmKeyArgs omKeyArgs) throws IOException;
 }

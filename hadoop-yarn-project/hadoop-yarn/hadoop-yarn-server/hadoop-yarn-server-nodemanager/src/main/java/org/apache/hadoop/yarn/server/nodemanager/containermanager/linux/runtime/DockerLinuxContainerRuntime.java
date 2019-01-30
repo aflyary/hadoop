@@ -21,19 +21,26 @@
 package org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.hadoop.hdfs.protocol.datatransfer.IOStreamPair;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.yarn.api.ApplicationConstants.Environment;
+import org.apache.hadoop.yarn.api.CsiAdaptorProtocol;
+import org.apache.hadoop.yarn.api.impl.pb.client.CsiAdaptorProtocolPBClientImpl;
 import org.apache.hadoop.yarn.api.records.ContainerId;
+import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.server.nodemanager.Context;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerCommandExecutor;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerExecCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerKillCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerRmCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerStartCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerVolumeCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.DockerCommandPlugin;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.ResourcePlugin;
+import org.apache.hadoop.yarn.server.nodemanager.containermanager.volume.csi.ContainerVolumePublisher;
 import org.apache.hadoop.yarn.util.DockerClientConfigHandler;
+import org.apache.hadoop.yarn.util.csi.CsiConfigUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -58,15 +65,16 @@ import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.resource
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerClient;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerInspectCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerRunCommand;
-import org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.runtime.docker.DockerStopCommand;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerExecutionException;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntime;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntimeConstants;
 import org.apache.hadoop.yarn.server.nodemanager.containermanager.runtime.ContainerRuntimeContext;
+import org.apache.hadoop.yarn.server.nodemanager.executor.ContainerExecContext;
 
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -74,6 +82,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -121,6 +130,13 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *     property.
  *   </li>
  *   <li>
+ *     {@code YARN_CONTAINER_RUNTIME_DOCKER_PORTS_MAPPING} allows users to
+ *     specify ports mapping for the bridge network Docker container. The value
+ *     of the environment variable should be a comma-separated list of ports
+ *     mapping. It's the same to "-p" option for the Docker run command. If the
+ *     value is empty, "-P" will be added.
+ *   </li>
+ *   <li>
  *     {@code YARN_CONTAINER_RUNTIME_DOCKER_CONTAINER_PID_NAMESPACE}
  *     controls which PID namespace will be used by the Docker container. By
  *     default, each Docker container has its own PID namespace. To share the
@@ -134,8 +150,8 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *   <li>
  *     {@code YARN_CONTAINER_RUNTIME_DOCKER_CONTAINER_HOSTNAME} sets the
  *     hostname to be used by the Docker container. If not specified, a
- *     hostname will be derived from the container ID.  This variable is
- *     ignored if the network is 'host' and Registry DNS is not enabled.
+ *     hostname will be derived from the container ID and set as default
+ *     hostname for networks other than 'host'.
  *   </li>
  *   <li>
  *     {@code YARN_CONTAINER_RUNTIME_DOCKER_RUN_PRIVILEGED_CONTAINER}
@@ -165,6 +181,11 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *     {@code docker.allowed.ro-mounts} and {@code docker.allowed.rw-mounts}.
  *   </li>
  *   <li>
+ *     {@code YARN_CONTAINER_RUNTIME_DOCKER_TMPFS_MOUNTS} allows users to
+ *     specify additional tmpfs mounts for the Docker container. The value of
+ *     the environment variable should be a comma-separated list of mounts.
+ *   </li>
+ *   <li>
  *     {@code YARN_CONTAINER_RUNTIME_DOCKER_DELAYED_REMOVAL} allows a user
  *     to request delayed deletion of the Docker containers on a per
  *     container basis. If true, Docker containers will not be removed until
@@ -174,6 +195,12 @@ import static org.apache.hadoop.yarn.server.nodemanager.containermanager.linux.r
  *     {@code yarn.nodemanager.runtime.linux.docker.delayed-removal.allowed}.
  *     This feature is disabled by default. When this feature is disabled or set
  *     to false, the container will be removed as soon as it exits.
+ *   </li>
+ *   <li>
+ *     {@code YARN_CONTAINER_RUNTIME_YARN_SYSFS_ENABLE} allows export yarn
+ *     service json to docker container.  This feature is disabled by default.
+ *     when this feature is set, app.json will be available in
+ *     /hadoop/yarn/sysfs/app.json.
  *   </li>
  * </ul>
  */
@@ -195,6 +222,12 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   private static final Pattern USER_MOUNT_PATTERN = Pattern.compile(
       "(?<=^|,)([^:\\x00]+):([^:\\x00]+)" +
           "(:(r[ow]|(r[ow][+])?(r?shared|r?slave|r?private)))?(?:,|$)");
+  private static final Pattern TMPFS_MOUNT_PATTERN = Pattern.compile(
+      "^/[^:\\x00]+$");
+  public static final String PORTS_MAPPING_PATTERN =
+      "^:[0-9]+|^[0-9]+:[0-9]+|^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]" +
+          "|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])" +
+          ":[0-9]+:[0-9]+$";
   private static final int HOST_NAME_LENGTH = 64;
   private static final String DEFAULT_PROCFS = "/proc";
 
@@ -220,12 +253,25 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   public static final String ENV_DOCKER_CONTAINER_MOUNTS =
       "YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS";
   @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_TMPFS_MOUNTS =
+      "YARN_CONTAINER_RUNTIME_DOCKER_TMPFS_MOUNTS";
+  @InterfaceAudience.Private
   public static final String ENV_DOCKER_CONTAINER_DELAYED_REMOVAL =
       "YARN_CONTAINER_RUNTIME_DOCKER_DELAYED_REMOVAL";
+  @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_PORTS_MAPPING =
+          "YARN_CONTAINER_RUNTIME_DOCKER_PORTS_MAPPING";
+  @InterfaceAudience.Private
+  public static final String ENV_DOCKER_CONTAINER_YARN_SYSFS =
+      "YARN_CONTAINER_RUNTIME_YARN_SYSFS_ENABLE";
+  public static final String YARN_SYSFS_PATH =
+      "/hadoop/yarn/sysfs";
   private Configuration conf;
   private Context nmContext;
   private DockerClient dockerClient;
+  private Map<String, CsiAdaptorProtocol> csiClients = new HashMap<>();
   private PrivilegedOperationExecutor privilegedOperationExecutor;
+  private String defaultImageName;
   private Set<String> allowedNetworks = new HashSet<>();
   private String defaultNetwork;
   private CGroupsHandler cGroupsHandler;
@@ -235,9 +281,9 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   private int userRemappingGidThreshold;
   private Set<String> capabilities;
   private boolean delayedRemovalAllowed;
-  private int dockerStopGracePeriod;
   private Set<String> defaultROMounts = new HashSet<>();
   private Set<String> defaultRWMounts = new HashSet<>();
+  private Set<String> defaultTmpfsMounts = new HashSet<>();
 
   /**
    * Return whether the given environment variables indicate that the operation
@@ -245,18 +291,19 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
    * called {@code YARN_CONTAINER_RUNTIME_TYPE} whose value is {@code docker},
    * this method will return true.  Otherwise it will return false.
    *
+   * @param daemonConf the NodeManager daemon configuration
    * @param env the environment variable settings for the operation
    * @return whether a Docker container is requested
    */
-  public static boolean isDockerContainerRequested(
+  public static boolean isDockerContainerRequested(Configuration daemonConf,
       Map<String, String> env) {
-    if (env == null) {
-      return false;
+    String type = (env == null)
+        ? null : env.get(ContainerRuntimeConstants.ENV_CONTAINER_TYPE);
+    if (type == null) {
+      type = daemonConf.get(YarnConfiguration.LINUX_CONTAINER_RUNTIME_TYPE);
     }
-
-    String type = env.get(ContainerRuntimeConstants.ENV_CONTAINER_TYPE);
-
-    return type != null && type.equals("docker");
+    return type != null && type.equals(
+        ContainerRuntimeConstants.CONTAINER_RUNTIME_DOCKER);
   }
 
   /**
@@ -302,6 +349,9 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     allowedNetworks.clear();
     defaultROMounts.clear();
     defaultRWMounts.clear();
+    defaultTmpfsMounts.clear();
+    defaultImageName = conf.getTrimmed(
+        YarnConfiguration.NM_DOCKER_IMAGE_NAME, "");
     allowedNetworks.addAll(Arrays.asList(
         conf.getTrimmedStrings(
             YarnConfiguration.NM_DOCKER_ALLOWED_CONTAINER_NETWORKS,
@@ -315,12 +365,14 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
           + " is not in the set of allowed networks: " + allowedNetworks;
 
       if (LOG.isWarnEnabled()) {
-        LOG.warn(message + ". Please check "
-            + "configuration");
+        LOG.warn(message + ". Please check configuration");
       }
 
       throw new ContainerExecutionException(message);
     }
+
+    // initialize csi adaptors if necessary
+    initiateCsiClients(conf);
 
     privilegedContainersAcl = new AccessControlList(conf.getTrimmed(
         YarnConfiguration.NM_DOCKER_PRIVILEGED_CONTAINERS_ACL,
@@ -344,10 +396,6 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
         YarnConfiguration.NM_DOCKER_ALLOW_DELAYED_REMOVAL,
         YarnConfiguration.DEFAULT_NM_DOCKER_ALLOW_DELAYED_REMOVAL);
 
-    dockerStopGracePeriod = conf.getInt(
-        YarnConfiguration.NM_DOCKER_STOP_GRACE_PERIOD,
-        YarnConfiguration.DEFAULT_NM_DOCKER_STOP_GRACE_PERIOD);
-
     defaultROMounts.addAll(Arrays.asList(
         conf.getTrimmedStrings(
         YarnConfiguration.NM_DOCKER_DEFAULT_RO_MOUNTS)));
@@ -355,6 +403,19 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     defaultRWMounts.addAll(Arrays.asList(
         conf.getTrimmedStrings(
         YarnConfiguration.NM_DOCKER_DEFAULT_RW_MOUNTS)));
+
+    defaultTmpfsMounts.addAll(Arrays.asList(
+        conf.getTrimmedStrings(
+        YarnConfiguration.NM_DOCKER_DEFAULT_TMPFS_MOUNTS)));
+  }
+
+  public Map<String, CsiAdaptorProtocol> getCsiClients() {
+    return csiClients;
+  }
+
+  @Override
+  public boolean isRuntimeRequested(Map<String, String> env) {
+    return isDockerContainerRequested(conf, env);
   }
 
   private Set<String> getDockerCapabilitiesFromConf() throws
@@ -410,32 +471,6 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
   @Override
   public void prepareContainer(ContainerRuntimeContext ctx)
       throws ContainerExecutionException {
-    Container container = ctx.getContainer();
-
-    // Create volumes when needed.
-    if (nmContext != null
-        && nmContext.getResourcePluginManager().getNameToPlugins() != null) {
-      for (ResourcePlugin plugin : nmContext.getResourcePluginManager()
-          .getNameToPlugins().values()) {
-        DockerCommandPlugin dockerCommandPlugin =
-            plugin.getDockerCommandPluginInstance();
-        if (dockerCommandPlugin != null) {
-          DockerVolumeCommand dockerVolumeCommand =
-              dockerCommandPlugin.getCreateDockerVolumeCommand(
-                  ctx.getContainer());
-          if (dockerVolumeCommand != null) {
-            runDockerVolumeCommand(dockerVolumeCommand, container);
-
-            // After volume created, run inspect to make sure volume properly
-            // created.
-            if (dockerVolumeCommand.getSubCommand().equals(
-                DockerVolumeCommand.VOLUME_CREATE_SUB_COMMAND)) {
-              checkDockerVolumeCreated(dockerVolumeCommand, container);
-            }
-          }
-        }
-      }
-    }
   }
 
   private void checkDockerVolumeCreated(
@@ -549,22 +584,34 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     }
   }
 
-  /** Set a DNS friendly hostname. */
-  private void setHostname(DockerRunCommand runCommand, String
-      containerIdStr, String name)
+  /** Set a DNS friendly hostname.
+   *  Only add hostname if network is not host or if hostname is
+   *  specified via YARN_CONTAINER_RUNTIME_DOCKER_CONTAINER_HOSTNAME
+   *  in host network mode
+   */
+  private void setHostname(DockerRunCommand runCommand,
+      String containerIdStr, String network, String name)
       throws ContainerExecutionException {
-    if (name == null || name.isEmpty()) {
-      name = RegistryPathUtils.encodeYarnID(containerIdStr);
 
-      String domain = conf.get(RegistryConstants.KEY_DNS_DOMAIN);
-      if (domain != null) {
-        name += ("." + domain);
+    if (network.equalsIgnoreCase("host")) {
+      if (name != null && !name.isEmpty()) {
+        LOG.info("setting hostname in container to: " + name);
+        runCommand.setHostname(name);
       }
-      validateHostname(name);
-    }
+    } else {
+      //get default hostname
+      if (name == null || name.isEmpty()) {
+        name = RegistryPathUtils.encodeYarnID(containerIdStr);
 
-    LOG.info("setting hostname in container to: " + name);
-    runCommand.setHostname(name);
+        String domain = conf.get(RegistryConstants.KEY_DNS_DOMAIN);
+        if (domain != null) {
+          name += ("." + domain);
+        }
+        validateHostname(name);
+      }
+      LOG.info("setting hostname in container to: " + name);
+      runCommand.setHostname(name);
+    }
   }
 
   /**
@@ -762,6 +809,9 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     String hostname = environment.get(ENV_DOCKER_CONTAINER_HOSTNAME);
     boolean useEntryPoint = checkUseEntryPoint(environment);
 
+    if (imageName == null || imageName.isEmpty()) {
+      imageName = defaultImageName;
+    }
     if(network == null || network.isEmpty()) {
       network = defaultNetwork;
     }
@@ -823,12 +873,21 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     DockerRunCommand runCommand = new DockerRunCommand(containerIdStr,
         dockerRunAsUser, imageName)
         .setNetworkType(network);
-    // Only add hostname if network is not host or if Registry DNS is enabled.
-    if (!network.equalsIgnoreCase("host") ||
-        conf.getBoolean(RegistryConstants.KEY_DNS_ENABLED,
-            RegistryConstants.DEFAULT_DNS_ENABLED)) {
-      setHostname(runCommand, containerIdStr, hostname);
+
+    setHostname(runCommand, containerIdStr, network, hostname);
+
+    // Add ports mapping value.
+    if (environment.containsKey(ENV_DOCKER_CONTAINER_PORTS_MAPPING)) {
+      String portsMapping = environment.get(ENV_DOCKER_CONTAINER_PORTS_MAPPING);
+      for (String mapping:portsMapping.split(",")) {
+        if (!Pattern.matches(PORTS_MAPPING_PATTERN, mapping)) {
+          throw new ContainerExecutionException(
+              "Invalid port mappings: " + mapping);
+        }
+        runCommand.addPortsMapping(mapping);
+      }
     }
+
     runCommand.setCapabilities(capabilities);
 
     runCommand.addAllReadWriteMountLocations(containerLogDirs);
@@ -898,6 +957,40 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       }
     }
 
+    ContainerVolumePublisher publisher = new ContainerVolumePublisher(
+        container, container.getCsiVolumesRootDir(), this);
+    try {
+      Map<String, String> volumeMounts = publisher.publishVolumes();
+      volumeMounts.forEach((local, remote) ->
+          runCommand.addReadWriteMountLocation(local, remote));
+    } catch (YarnException | IOException e) {
+      throw new ContainerExecutionException(
+          "Container requests for volume resource but we are failed"
+              + " to publish volumes on this node");
+    }
+
+    if (environment.containsKey(ENV_DOCKER_CONTAINER_TMPFS_MOUNTS)) {
+      String[] tmpfsMounts = environment.get(ENV_DOCKER_CONTAINER_TMPFS_MOUNTS)
+          .split(",");
+      for (String mount : tmpfsMounts) {
+        if (!TMPFS_MOUNT_PATTERN.matcher(mount).matches()) {
+          throw new ContainerExecutionException("Invalid tmpfs mount : " +
+              mount);
+        }
+        runCommand.addTmpfsMount(mount);
+      }
+    }
+
+    if (defaultTmpfsMounts != null && !defaultTmpfsMounts.isEmpty()) {
+      for (String mount : defaultTmpfsMounts) {
+        if (!TMPFS_MOUNT_PATTERN.matcher(mount).matches()) {
+          throw new ContainerExecutionException("Invalid tmpfs mount : " +
+              mount);
+        }
+        runCommand.addTmpfsMount(mount);
+      }
+    }
+
     if (allowHostPidNamespace(container)) {
       runCommand.setPidNamespace("host");
     }
@@ -911,6 +1004,12 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     String resourcesOpts = ctx.getExecutionAttribute(RESOURCES_OPTIONS);
 
     addCGroupParentIfRequired(resourcesOpts, containerIdStr, runCommand);
+
+    if(environment.containsKey(ENV_DOCKER_CONTAINER_YARN_SYSFS) &&
+        Boolean.parseBoolean(environment
+            .get(ENV_DOCKER_CONTAINER_YARN_SYSFS))) {
+      runCommand.setYarnSysFS(true);
+    }
 
     if (useEntryPoint) {
       runCommand.setOverrideDisabled(true);
@@ -936,14 +1035,30 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       }
     }
 
-    // use plugins to update docker run command.
+    // use plugins to create volume and update docker run command.
     if (nmContext != null
         && nmContext.getResourcePluginManager().getNameToPlugins() != null) {
       for (ResourcePlugin plugin : nmContext.getResourcePluginManager()
           .getNameToPlugins().values()) {
         DockerCommandPlugin dockerCommandPlugin =
             plugin.getDockerCommandPluginInstance();
+
         if (dockerCommandPlugin != null) {
+          // Create volumes when needed.
+          DockerVolumeCommand dockerVolumeCommand =
+              dockerCommandPlugin.getCreateDockerVolumeCommand(
+                  ctx.getContainer());
+          if (dockerVolumeCommand != null) {
+            runDockerVolumeCommand(dockerVolumeCommand, container);
+
+            // After volume created, run inspect to make sure volume properly
+            // created.
+            if (dockerVolumeCommand.getSubCommand().equals(
+                DockerVolumeCommand.VOLUME_CREATE_SUB_COMMAND)) {
+              checkDockerVolumeCreated(dockerVolumeCommand, container);
+            }
+          }
+          // Update cmd
           dockerCommandPlugin.updateDockerRunCommand(runCommand, container);
         }
       }
@@ -1032,7 +1147,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
       if (ContainerExecutor.Signal.NULL.equals(signal)) {
         executeLivelinessCheck(ctx);
       } else if (ContainerExecutor.Signal.TERM.equals(signal)) {
-        String containerId = ctx.getContainer().getContainerId().toString();
+        ContainerId containerId = ctx.getContainer().getContainerId();
         handleContainerStop(containerId, env);
       } else {
         handleContainerKill(ctx, env, signal);
@@ -1075,6 +1190,52 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     }
   }
 
+  /**
+   * Perform docker exec command into running container
+   *
+   * @param ctx container exec context
+   * @return IOStreams of docker exec
+   * @throws ContainerExecutionException
+   */
+  @Override
+  public IOStreamPair execContainer(ContainerExecContext ctx)
+      throws ContainerExecutionException {
+    String containerId = ctx.getContainer().getContainerId().toString();
+    DockerExecCommand dockerExecCommand = new DockerExecCommand(containerId);
+    dockerExecCommand.setInteractive();
+    dockerExecCommand.setTTY();
+    List<String> command = new ArrayList<String>();
+    StringBuilder sb = new StringBuilder();
+    sb.append("/bin/");
+    sb.append(ctx.getShell());
+    command.add(sb.toString());
+    command.add("-i");
+    dockerExecCommand.setOverrideCommandWithArgs(command);
+    String commandFile = dockerClient.writeCommandToTempFile(dockerExecCommand,
+        ContainerId.fromString(containerId), nmContext);
+    PrivilegedOperation privOp = new PrivilegedOperation(
+        PrivilegedOperation.OperationType.EXEC_CONTAINER);
+    privOp.appendArgs(commandFile);
+    privOp.disableFailureLogging();
+
+    IOStreamPair output;
+    try {
+      output =
+          privilegedOperationExecutor.executePrivilegedInteractiveOperation(
+              null, privOp);
+      LOG.info("ContainerId=" + containerId + ", docker exec output for "
+          + dockerExecCommand + ": " + output);
+    } catch (PrivilegedOperationException e) {
+      throw new ContainerExecutionException(
+          "Execute container interactive shell failed", e.getExitCode(),
+          e.getOutput(), e.getErrorOutput());
+    } catch (InterruptedException ie) {
+      LOG.warn("InterruptedException executing command: ", ie);
+      throw new ContainerExecutionException(ie.getMessage());
+    }
+    return output;
+  }
+
 
   // ipAndHost[0] contains comma separated list of IPs
   // ipAndHost[1] contains the hostname.
@@ -1085,14 +1246,7 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     DockerInspectCommand inspectCommand =
         new DockerInspectCommand(containerIdStr).getIpAndHost();
     try {
-      String commandFile = dockerClient.writeCommandToTempFile(inspectCommand,
-          containerId, nmContext);
-      PrivilegedOperation privOp = new PrivilegedOperation(
-          PrivilegedOperation.OperationType.RUN_DOCKER_CMD);
-      privOp.appendArgs(commandFile);
-      String output = privilegedOperationExecutor
-          .executePrivilegedOperation(null, privOp, null,
-              null, true, false);
+      String output = executeDockerInspect(containerId, inspectCommand);
       LOG.info("Docker inspect output for " + containerId + ": " + output);
       // strip off quotes if any
       output = output.replaceAll("['\"]", "");
@@ -1141,7 +1295,23 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     return null;
   }
 
-
+  @Override
+  public String getExposedPorts(Container container)
+      throws ContainerExecutionException {
+    ContainerId containerId = container.getContainerId();
+    String containerIdStr = containerId.toString();
+    DockerInspectCommand inspectCommand =
+        new DockerInspectCommand(containerIdStr).getExposedPorts();
+    try {
+      String output = executeDockerInspect(containerId, inspectCommand);
+      return output;
+    } catch (ContainerExecutionException e) {
+      LOG.error("Error when writing command to temp file", e);
+    } catch (PrivilegedOperationException e) {
+      LOG.error("Error when executing command.", e);
+    }
+    return null;
+  }
 
   private PrivilegedOperation buildLaunchOp(ContainerRuntimeContext ctx,
       String commandFile, DockerCommand command) {
@@ -1156,26 +1326,34 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     List<String> localDirs = ctx.getExecutionAttribute(LOCAL_DIRS);
     @SuppressWarnings("unchecked")
     List<String> logDirs = ctx.getExecutionAttribute(LOG_DIRS);
-    String resourcesOpts = ctx.getExecutionAttribute(RESOURCES_OPTIONS);
 
     PrivilegedOperation launchOp = new PrivilegedOperation(
             PrivilegedOperation.OperationType.LAUNCH_DOCKER_CONTAINER);
 
     launchOp.appendArgs(runAsUser, ctx.getExecutionAttribute(USER),
-            Integer.toString(PrivilegedOperation
-                    .RunAsUserCommand.LAUNCH_DOCKER_CONTAINER.getValue()),
-            ctx.getExecutionAttribute(APPID),
-            containerIdStr,
-            containerWorkDir.toString(),
-            nmPrivateContainerScriptPath.toUri().getPath(),
-            ctx.getExecutionAttribute(NM_PRIVATE_TOKENS_PATH).toUri().getPath(),
-            ctx.getExecutionAttribute(PID_FILE_PATH).toString(),
-            StringUtils.join(PrivilegedOperation.LINUX_FILE_PATH_SEPARATOR,
-                    localDirs),
-            StringUtils.join(PrivilegedOperation.LINUX_FILE_PATH_SEPARATOR,
-                    logDirs),
-            commandFile,
-            resourcesOpts);
+        Integer.toString(PrivilegedOperation
+            .RunAsUserCommand.LAUNCH_DOCKER_CONTAINER.getValue()),
+        ctx.getExecutionAttribute(APPID),
+        containerIdStr,
+        containerWorkDir.toString(),
+        nmPrivateContainerScriptPath.toUri().getPath(),
+        ctx.getExecutionAttribute(NM_PRIVATE_TOKENS_PATH).toUri().getPath());
+    Path keystorePath = ctx.getExecutionAttribute(NM_PRIVATE_KEYSTORE_PATH);
+    Path truststorePath = ctx.getExecutionAttribute(NM_PRIVATE_TRUSTSTORE_PATH);
+    if (keystorePath != null && truststorePath != null) {
+      launchOp.appendArgs("--https",
+          keystorePath.toUri().getPath(),
+          truststorePath.toUri().getPath());
+    } else {
+      launchOp.appendArgs("--http");
+    }
+    launchOp.appendArgs(
+        ctx.getExecutionAttribute(PID_FILE_PATH).toString(),
+        StringUtils.join(PrivilegedOperation.LINUX_FILE_PATH_SEPARATOR,
+            localDirs),
+        StringUtils.join(PrivilegedOperation.LINUX_FILE_PATH_SEPARATOR,
+            logDirs),
+        commandFile);
 
     String tcCommandFile = ctx.getExecutionAttribute(TC_COMMAND_FILE);
 
@@ -1216,29 +1394,88 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
     }
   }
 
-  private void handleContainerStop(String containerId, Map<String, String> env)
+  /**
+   * Handles a docker container stop by first finding the {@code STOPSIGNAL}
+   * using docker inspect and then executing
+   * {@code docker kill --signal=<STOPSIGNAL>}.
+   * It doesn't rely on the docker stop because that sends a {@code SIGKILL}
+   * to the root process in the container after the {@code STOPSIGNAL}.The grace
+   * period which the docker stop uses has granularity in seconds. However, NM
+   * is designed to explicitly send a {@code SIGKILL} to the containers after a
+   * grace period which has a granularity of millis. It doesn't want the docker
+   * stop to send {@code SIGKILL} but docker stop has no option to disallow
+   * that.
+   *
+   * @param containerId container id
+   * @param env         env
+   * @throws ContainerExecutionException
+   */
+  private void handleContainerStop(ContainerId containerId,
+      Map<String, String> env)
       throws ContainerExecutionException {
+
     DockerCommandExecutor.DockerContainerStatus containerStatus =
-        DockerCommandExecutor.getContainerStatus(containerId,
-            privilegedOperationExecutor, nmContext);
-    if (DockerCommandExecutor.isStoppable(containerStatus)) {
-      DockerStopCommand dockerStopCommand = new DockerStopCommand(
-          containerId).setGracePeriod(dockerStopGracePeriod);
-      DockerCommandExecutor.executeDockerCommand(dockerStopCommand, containerId,
-          env, privilegedOperationExecutor, false, nmContext);
-    } else {
-      if (LOG.isDebugEnabled()) {
-        LOG.debug(
-            "Container status is " + containerStatus.getName()
-                + ", skipping stop - " + containerId);
+        DockerCommandExecutor.DockerContainerStatus.UNKNOWN;
+    String stopSignal = ContainerExecutor.Signal.TERM.toString();
+    char delimiter = ',';
+    DockerInspectCommand inspectCommand =
+        new DockerInspectCommand(containerId.toString()).get(new String[] {
+            DockerInspectCommand.STATUS_TEMPLATE,
+            DockerInspectCommand.STOPSIGNAL_TEMPLATE}, delimiter);
+    try {
+      String output = executeDockerInspect(containerId, inspectCommand).trim();
+
+      if (!output.isEmpty()) {
+        String[] statusAndSignal = StringUtils.split(output, delimiter);
+        containerStatus = DockerCommandExecutor.parseContainerStatus(
+            statusAndSignal[0]);
+        if (statusAndSignal.length > 1) {
+          stopSignal = statusAndSignal[1];
+        }
       }
+    } catch (ContainerExecutionException | PrivilegedOperationException e) {
+      LOG.debug("{} inspect failed, skipping stop", containerId, e);
+      return;
     }
+
+    if (DockerCommandExecutor.isStoppable(containerStatus)) {
+
+      DockerKillCommand dockerStopCommand = new DockerKillCommand(
+          containerId.toString()).setSignal(stopSignal);
+      DockerCommandExecutor.executeDockerCommand(dockerStopCommand,
+          containerId.toString(), env, privilegedOperationExecutor, false,
+          nmContext);
+    } else {
+      LOG.debug("{} status is {}, skipping stop", containerId, containerStatus);
+    }
+  }
+
+  private String executeDockerInspect(ContainerId containerId,
+      DockerInspectCommand inspectCommand) throws ContainerExecutionException,
+      PrivilegedOperationException {
+    String commandFile = dockerClient.writeCommandToTempFile(inspectCommand,
+        containerId, nmContext);
+    PrivilegedOperation privOp = new PrivilegedOperation(
+        PrivilegedOperation.OperationType.RUN_DOCKER_CMD);
+    privOp.appendArgs(commandFile);
+    String output = privilegedOperationExecutor.executePrivilegedOperation(null,
+        privOp, null, null, true, false);
+    LOG.info("{} : docker inspect output {} ", containerId, output);
+    return output;
   }
 
   private void handleContainerKill(ContainerRuntimeContext ctx,
       Map<String, String> env,
       ContainerExecutor.Signal signal) throws ContainerExecutionException {
     Container container = ctx.getContainer();
+
+    ContainerVolumePublisher publisher = new ContainerVolumePublisher(
+        container, container.getCsiVolumesRootDir(), this);
+    try {
+      publisher.unpublishVolumes();
+    } catch (YarnException | IOException e) {
+      throw new ContainerExecutionException(e);
+    }
 
     // Only need to check whether the container was asked to be privileged.
     // If the container had failed the permissions checks upon launch, it
@@ -1294,7 +1531,8 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
           DockerCommandExecutor.getContainerStatus(containerId,
               privilegedOperationExecutor, nmContext);
       if (DockerCommandExecutor.isRemovable(containerStatus)) {
-        DockerRmCommand dockerRmCommand = new DockerRmCommand(containerId);
+        DockerRmCommand dockerRmCommand = new DockerRmCommand(containerId,
+            ResourceHandlerModule.getCgroupsRelativeRoot());
         DockerCommandExecutor.executeDockerCommand(dockerRmCommand, containerId,
             env, privilegedOperationExecutor, false, nmContext);
       }
@@ -1329,6 +1567,36 @@ public class DockerLinuxContainerRuntime implements LinuxContainerRuntime {
                 "Unable to write Docker client credentials to "
                     + dockerConfigPath);
           }
+        }
+      }
+    }
+  }
+
+  /**
+   * Initiate CSI clients to talk to the CSI adaptors on this node and
+   * cache the clients for easier fetch.
+   * @param config configuration
+   * @throws ContainerExecutionException
+   */
+  private void initiateCsiClients(Configuration config)
+      throws ContainerExecutionException {
+    String[] driverNames = CsiConfigUtils.getCsiDriverNames(config);
+    if (driverNames != null && driverNames.length > 0) {
+      for (String driverName : driverNames) {
+        try {
+          // find out the adaptors service address
+          InetSocketAddress adaptorServiceAddress =
+              CsiConfigUtils.getCsiAdaptorAddressForDriver(driverName, config);
+          LOG.info("Initializing a csi-adaptor-client for csi-adaptor {},"
+              + " csi-driver {}", adaptorServiceAddress.toString(), driverName);
+          CsiAdaptorProtocolPBClientImpl client =
+              new CsiAdaptorProtocolPBClientImpl(1L, adaptorServiceAddress,
+                  config);
+          csiClients.put(driverName, client);
+        } catch (IOException e1) {
+          throw new ContainerExecutionException(e1.getMessage());
+        } catch (YarnException e2) {
+          throw new ContainerExecutionException(e2.getMessage());
         }
       }
     }

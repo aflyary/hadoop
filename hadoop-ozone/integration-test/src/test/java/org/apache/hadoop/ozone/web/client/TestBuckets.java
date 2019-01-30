@@ -19,7 +19,6 @@ package org.apache.hadoop.ozone.web.client;
 
 import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.OzoneAcl;
-import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.ozone.client.BucketArgs;
 import org.apache.hadoop.ozone.client.VolumeArgs;
@@ -31,7 +30,6 @@ import org.apache.hadoop.ozone.client.rest.RestClient;
 import org.apache.hadoop.ozone.client.rpc.RpcClient;
 import org.apache.hadoop.ozone.web.request.OzoneQuota;
 import org.apache.hadoop.ozone.web.utils.OzoneUtils;
-import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.Time;
 import org.junit.AfterClass;
 import org.junit.Before;
@@ -80,15 +78,14 @@ public class TestBuckets {
     return Arrays.asList(params);
   }
 
+  @SuppressWarnings("visibilitymodifier")
   @Parameterized.Parameter
   public static Class clientProtocol;
 
   /**
    * Create a MiniDFSCluster for testing.
    * <p>
-   * Ozone is made active by setting OZONE_ENABLED = true and
-   * OZONE_HANDLER_TYPE_KEY = "local" , which uses a local directory to
-   * emulate Ozone backend.
+   * Ozone is made active by setting OZONE_ENABLED = true
    *
    * @throws IOException
    */
@@ -98,12 +95,6 @@ public class TestBuckets {
       InterruptedException {
     conf = new OzoneConfiguration();
 
-    String path = GenericTestUtils
-        .getTempPath(TestBuckets.class.getSimpleName());
-    path += conf.getTrimmed(OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT,
-        OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT_DEFAULT);
-
-    conf.set(OzoneConfigKeys.OZONE_LOCALSTORAGE_ROOT, path);
     cluster = MiniOzoneCluster.newBuilder(conf)
         .setNumDatanodes(3)
         .build();
@@ -134,16 +125,16 @@ public class TestBuckets {
     runTestCreateBucket(client);
   }
 
-  static void runTestCreateBucket(ClientProtocol client)
-      throws OzoneException, IOException, ParseException {
+  static void runTestCreateBucket(ClientProtocol protocol)
+      throws IOException {
     String volumeName = OzoneUtils.getRequestID().toLowerCase();
     VolumeArgs volumeArgs = VolumeArgs.newBuilder()
         .setOwner("bilbo")
         .setQuota("100TB")
         .setAdmin("hdfs")
         .build();
-    client.createVolume(volumeName, volumeArgs);
-    OzoneVolume vol = client.getVolumeDetails(volumeName);
+    protocol.createVolume(volumeName, volumeArgs);
+    OzoneVolume vol = protocol.getVolumeDetails(volumeName);
     String[] acls = {"user:frodo:rw", "user:samwise:rw"};
 
     // create 10 buckets under same volume
@@ -164,7 +155,7 @@ public class TestBuckets {
       // verify the bucket creation time
       assertTrue((bucket.getCreationTime() / 1000) >= (currentTime / 1000));
     }
-    client.close();
+    protocol.close();
 
     assertEquals(vol.getName(), volumeName);
     assertEquals(vol.getAdmin(), "hdfs");
@@ -189,7 +180,7 @@ public class TestBuckets {
     runTestAddBucketAcls(client);
   }
 
-  static void runTestAddBucketAcls(ClientProtocol client)
+  static void runTestAddBucketAcls(ClientProtocol protocol)
       throws OzoneException, IOException, ParseException {
     String volumeName = OzoneUtils.getRequestID().toLowerCase();
     VolumeArgs volumeArgs = VolumeArgs.newBuilder()
@@ -197,8 +188,8 @@ public class TestBuckets {
         .setQuota("100TB")
         .setAdmin("hdfs")
         .build();
-    client.createVolume(volumeName, volumeArgs);
-    OzoneVolume vol = client.getVolumeDetails(volumeName);
+    protocol.createVolume(volumeName, volumeArgs);
+    OzoneVolume vol = protocol.getVolumeDetails(volumeName);
     String[] acls = {"user:frodo:rw", "user:samwise:rw"};
     String bucketName = OzoneUtils.getRequestID().toLowerCase();
     vol.createBucket(bucketName);
@@ -213,7 +204,7 @@ public class TestBuckets {
     // verify if the creation time is missing after update operation
     assertTrue(
         (updatedBucket.getCreationTime()) / 1000 >= 0);
-    client.close();
+    protocol.close();
   }
 
   @Test
@@ -221,7 +212,7 @@ public class TestBuckets {
     runTestRemoveBucketAcls(client);
   }
 
-  static void runTestRemoveBucketAcls(ClientProtocol client)
+  static void runTestRemoveBucketAcls(ClientProtocol protocol)
       throws OzoneException, IOException, ParseException {
     String volumeName = OzoneUtils.getRequestID().toLowerCase();
     VolumeArgs volumeArgs = VolumeArgs.newBuilder()
@@ -229,8 +220,8 @@ public class TestBuckets {
         .setQuota("100TB")
         .setAdmin("hdfs")
         .build();
-    client.createVolume(volumeName, volumeArgs);
-    OzoneVolume vol = client.getVolumeDetails(volumeName);
+    protocol.createVolume(volumeName, volumeArgs);
+    OzoneVolume vol = protocol.getVolumeDetails(volumeName);
     String[] acls = {"user:frodo:rw", "user:samwise:rw"};
     String bucketName = OzoneUtils.getRequestID().toLowerCase();
     List<OzoneAcl> aclList =
@@ -249,7 +240,7 @@ public class TestBuckets {
     // verify if the creation time is missing after update operation
     assertTrue(
         (updatedBucket.getCreationTime() / 1000) >= 0);
-    client.close();
+    protocol.close();
   }
 
   @Test
@@ -257,7 +248,7 @@ public class TestBuckets {
     runTestDeleteBucket(client);
   }
 
-  static void runTestDeleteBucket(ClientProtocol client)
+  static void runTestDeleteBucket(ClientProtocol protocol)
       throws OzoneException, IOException {
     String volumeName = OzoneUtils.getRequestID().toLowerCase();
     VolumeArgs volumeArgs = VolumeArgs.newBuilder()
@@ -265,8 +256,8 @@ public class TestBuckets {
         .setQuota("100TB")
         .setAdmin("hdfs")
         .build();
-    client.createVolume(volumeName, volumeArgs);
-    OzoneVolume vol = client.getVolumeDetails(volumeName);
+    protocol.createVolume(volumeName, volumeArgs);
+    OzoneVolume vol = protocol.getVolumeDetails(volumeName);
     String[] acls = {"user:frodo:rw", "user:samwise:rw"};
     String bucketName = OzoneUtils.getRequestID().toLowerCase();
     List<OzoneAcl> aclList =
@@ -284,7 +275,7 @@ public class TestBuckets {
       // must throw
       assertNotNull(ex);
     }
-    client.close();
+    protocol.close();
   }
 
   @Test
@@ -292,7 +283,7 @@ public class TestBuckets {
     runTestListBucket(client);
   }
 
-  static void runTestListBucket(ClientProtocol client)
+  static void runTestListBucket(ClientProtocol protocol)
       throws OzoneException, IOException, ParseException {
     String volumeName = OzoneUtils.getRequestID().toLowerCase();
     VolumeArgs volumeArgs = VolumeArgs.newBuilder()
@@ -300,11 +291,11 @@ public class TestBuckets {
         .setQuota("100TB")
         .setAdmin("hdfs")
         .build();
-    client.createVolume(volumeName, volumeArgs);
-    OzoneVolume vol = client.getVolumeDetails(volumeName);
+    protocol.createVolume(volumeName, volumeArgs);
+    OzoneVolume vol = protocol.getVolumeDetails(volumeName);
     String[] acls = {"user:frodo:rw", "user:samwise:rw"};
     List<OzoneAcl> aclList =
-        Arrays.stream(acls).map(acl -> OzoneAcl.parseAcl(acl))
+        Arrays.stream(acls).map(OzoneAcl::parseAcl)
             .collect(Collectors.toList());
 
     long currentTime = Time.now();
@@ -315,7 +306,7 @@ public class TestBuckets {
           .build();
       vol.createBucket(bucketName, bucketArgs);
     }
-    Iterator<OzoneBucket> bucketIterator = vol.listBuckets(null);
+    Iterator<? extends OzoneBucket> bucketIterator = vol.listBuckets(null);
     int count = 0;
 
     while (bucketIterator.hasNext()) {
@@ -331,10 +322,10 @@ public class TestBuckets {
     bucketIterator = vol.listBuckets(null, "listbucket-test-3");
     assertEquals(getSize(bucketIterator), 6);
 
-    client.close();
+    protocol.close();
   }
 
-  private static int getSize(Iterator<OzoneBucket> bucketIterator) {
+  private static int getSize(Iterator<? extends OzoneBucket> bucketIterator) {
     int count = 0;
     while (bucketIterator.hasNext()) {
       count++;

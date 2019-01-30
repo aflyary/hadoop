@@ -20,6 +20,7 @@ package org.apache.hadoop.hdds.scm.command;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.CommandStatus;
+import org.apache.hadoop.hdds.scm.container.replication.ReplicationManager;
 import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.server.SCMDatanodeHeartbeatDispatcher
     .CommandStatusReportFromDatanode;
@@ -57,15 +58,24 @@ public class CommandStatusReportHandler implements
       case replicateContainerCommand:
         publisher.fireEvent(SCMEvents.REPLICATION_STATUS, new
             ReplicationStatus(cmdStatus));
-        break;
-      case closeContainerCommand:
-        publisher.fireEvent(SCMEvents.CLOSE_CONTAINER_STATUS, new
-            CloseContainerStatus(cmdStatus));
+        if (cmdStatus.getStatus() == CommandStatus.Status.EXECUTED) {
+          publisher.fireEvent(SCMEvents.REPLICATION_COMPLETE,
+              new ReplicationManager.ReplicationCompleted(
+                  cmdStatus.getCmdId()));
+        }
         break;
       case deleteBlocksCommand:
-        publisher.fireEvent(SCMEvents.DELETE_BLOCK_STATUS, new
-            DeleteBlockCommandStatus(cmdStatus));
+        if (cmdStatus.getStatus() == CommandStatus.Status.EXECUTED) {
+          publisher.fireEvent(SCMEvents.DELETE_BLOCK_STATUS,
+              new DeleteBlockStatus(cmdStatus));
+        }
         break;
+      case deleteContainerCommand:
+        if (cmdStatus.getStatus() == CommandStatus.Status.EXECUTED) {
+          publisher.fireEvent(SCMEvents.DELETE_CONTAINER_COMMAND_COMPLETE,
+              new ReplicationManager.DeleteContainerCommandCompleted(
+                  cmdStatus.getCmdId()));
+        }
       default:
         LOGGER.debug("CommandStatus of type:{} not handled in " +
             "CommandStatusReportHandler.", cmdStatus.getType());
@@ -103,7 +113,7 @@ public class CommandStatusReportHandler implements
    * Wrapper event for Replicate Command.
    */
   public static class ReplicationStatus extends CommandStatusEvent {
-    ReplicationStatus(CommandStatus cmdStatus) {
+    public ReplicationStatus(CommandStatus cmdStatus) {
       super(cmdStatus);
     }
   }
@@ -112,7 +122,7 @@ public class CommandStatusReportHandler implements
    * Wrapper event for CloseContainer Command.
    */
   public static class CloseContainerStatus extends CommandStatusEvent {
-    CloseContainerStatus(CommandStatus cmdStatus) {
+    public CloseContainerStatus(CommandStatus cmdStatus) {
       super(cmdStatus);
     }
   }
@@ -120,8 +130,8 @@ public class CommandStatusReportHandler implements
   /**
    * Wrapper event for DeleteBlock Command.
    */
-  public static class DeleteBlockCommandStatus extends CommandStatusEvent {
-    DeleteBlockCommandStatus(CommandStatus cmdStatus) {
+  public static class DeleteBlockStatus extends CommandStatusEvent {
+    public DeleteBlockStatus(CommandStatus cmdStatus) {
       super(cmdStatus);
     }
   }

@@ -18,122 +18,69 @@
 
 package org.apache.hadoop.ozone.container.common.transport.server;
 
-import com.google.common.base.Preconditions;
-import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
-import org.apache.ratis.shaded.io.netty.bootstrap.ServerBootstrap;
-import org.apache.ratis.shaded.io.netty.channel.Channel;
-import org.apache.ratis.shaded.io.netty.channel.EventLoopGroup;
-import org.apache.ratis.shaded.io.netty.channel.nio.NioEventLoopGroup;
-import org.apache.ratis.shaded.io.netty.channel.socket.nio
-    .NioServerSocketChannel;
-import org.apache.ratis.shaded.io.netty.handler.logging.LogLevel;
-import org.apache.ratis.shaded.io.netty.handler.logging.LoggingHandler;
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerCommandRequestProto;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
-import org.apache.hadoop.ozone.OzoneConfigKeys;
-import org.apache.hadoop.ozone.container.common.interfaces.ContainerDispatcher;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.hadoop.hdds.security.exception.SCMSecurityException;
+import org.apache.hadoop.hdds.security.token.BlockTokenVerifier;
+import org.apache.hadoop.hdds.security.token.TokenVerifier;
+import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
-import java.net.ServerSocket;
-import java.net.SocketAddress;
+import java.util.Objects;
 
 /**
- * Creates a netty server endpoint that acts as the communication layer for
- * Ozone containers.
+ * A server endpoint that acts as the communication layer for Ozone containers.
  */
-public final class XceiverServer implements XceiverServerSpi {
-  private static final Logger
-      LOG = LoggerFactory.getLogger(XceiverServer.class);
-  private int port;
-  private final ContainerDispatcher storageContainer;
+public abstract class XceiverServer implements XceiverServerSpi {
 
-  private EventLoopGroup bossGroup;
-  private EventLoopGroup workerGroup;
-  private Channel channel;
+  private final SecurityConfig secConfig;
+  private final TokenVerifier tokenVerifier;
+
+  public XceiverServer(Configuration conf) {
+    Objects.nonNull(conf);
+    this.secConfig = new SecurityConfig(conf);
+    tokenVerifier = new BlockTokenVerifier(secConfig, getCaClient());
+  }
 
   /**
-   * Constructs a netty server class.
+   * Default implementation which just validates security token if security is
+   * enabled.
    *
-   * @param conf - Configuration
+   * @param request ContainerCommandRequest
    */
-  public XceiverServer(DatanodeDetails datanodeDetails, Configuration conf,
-                       ContainerDispatcher dispatcher) {
-    Preconditions.checkNotNull(conf);
-
-    this.port = conf.getInt(OzoneConfigKeys.DFS_CONTAINER_IPC_PORT,
-        OzoneConfigKeys.DFS_CONTAINER_IPC_PORT_DEFAULT);
-    // Get an available port on current node and
-    // use that as the container port
-    if (conf.getBoolean(OzoneConfigKeys.DFS_CONTAINER_IPC_RANDOM_PORT,
-        OzoneConfigKeys.DFS_CONTAINER_IPC_RANDOM_PORT_DEFAULT)) {
-      try (ServerSocket socket = new ServerSocket()) {
-        socket.setReuseAddress(true);
-        SocketAddress address = new InetSocketAddress(0);
-        socket.bind(address);
-        this.port = socket.getLocalPort();
-        LOG.info("Found a free port for the server : {}", this.port);
-      } catch (IOException e) {
-        LOG.error("Unable find a random free port for the server, "
-            + "fallback to use default port {}", this.port, e);
+  @Override
+  public void submitRequest(ContainerCommandRequestProto request,
+      HddsProtos.PipelineID pipelineID) throws IOException {
+    if (secConfig.isSecurityEnabled()) {
+      String encodedToken = request.getEncodedToken();
+      if (encodedToken == null) {
+        throw new SCMSecurityException("Security is enabled but client " +
+            "request is missing block token.",
+            SCMSecurityException.ErrorCode.MISSING_BLOCK_TOKEN);
       }
-    }
-    datanodeDetails.setPort(
-        DatanodeDetails.newPort(DatanodeDetails.Port.Name.STANDALONE, port));
-    this.storageContainer = dispatcher;
-  }
-
-  @Override
-  public int getIPCPort() {
-    return this.port;
-  }
-
-  /**
-   * Returns the Replication type supported by this end-point.
-   *
-   * @return enum -- {Stand_Alone, Ratis, Chained}
-   */
-  @Override
-  public HddsProtos.ReplicationType getServerType() {
-    return HddsProtos.ReplicationType.STAND_ALONE;
-  }
-
-  @Override
-  public void start() throws IOException {
-    bossGroup = new NioEventLoopGroup();
-    workerGroup = new NioEventLoopGroup();
-    channel = new ServerBootstrap()
-        .group(bossGroup, workerGroup)
-        .channel(NioServerSocketChannel.class)
-        .handler(new LoggingHandler(LogLevel.INFO))
-        .childHandler(new XceiverServerInitializer(storageContainer))
-        .bind(port)
-        .syncUninterruptibly()
-        .channel();
-  }
-
-  @Override
-  public void stop() {
-    if (storageContainer != null) {
-      storageContainer.shutdown();
-    }
-    if (bossGroup != null) {
-      bossGroup.shutdownGracefully();
-    }
-    if (workerGroup != null) {
-      workerGroup.shutdownGracefully();
-    }
-    if (channel != null) {
-      channel.close().awaitUninterruptibly();
+      tokenVerifier.verify(encodedToken, "");
     }
   }
 
-  @Override
-  public void submitRequest(
-      ContainerProtos.ContainerCommandRequestProto request) throws IOException {
-    storageContainer.dispatch(request);
+  @VisibleForTesting
+  protected CertificateClient getCaClient() {
+    // TODO: instantiate CertificateClient
+    return null;
   }
+
+  protected SecurityConfig getSecurityConfig() {
+    return secConfig;
+  }
+
+  protected TokenVerifier getBlockTokenVerifier() {
+    return tokenVerifier;
+  }
+
+  public SecurityConfig getSecConfig() {
+    return secConfig;
+  }
+
 }

@@ -16,12 +16,19 @@
  */
 package org.apache.hadoop.ozone.container.common.statemachine;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
-import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.CommandStatusReportsProto;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.PipelineReportsProto;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.CommandStatusReportsProto;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.ContainerReportsProto;
 import org.apache.hadoop.hdds.protocol.proto
@@ -34,21 +41,24 @@ import org.apache.hadoop.ozone.container.common.statemachine.commandhandler
 import org.apache.hadoop.ozone.container.common.statemachine.commandhandler
     .DeleteBlocksCommandHandler;
 import org.apache.hadoop.ozone.container.common.statemachine.commandhandler
+    .DeleteContainerCommandHandler;
+import org.apache.hadoop.ozone.container.common.statemachine.commandhandler
     .ReplicateContainerCommandHandler;
+import org.apache.hadoop.ozone.container.keyvalue.TarContainerPacker;
 import org.apache.hadoop.ozone.container.ozoneimpl.OzoneContainer;
+import org.apache.hadoop.ozone.container.replication.ContainerReplicator;
+import org.apache.hadoop.ozone.container.replication.DownloadAndImportReplicator;
+import org.apache.hadoop.ozone.container.replication.ReplicationSupervisor;
+import org.apache.hadoop.ozone.container.replication.SimpleContainerDownloader;
 import org.apache.hadoop.ozone.protocol.commands.SCMCommand;
+import org.apache.hadoop.util.JvmPauseMonitor;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.util.concurrent.HadoopExecutors;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import java.io.Closeable;
-import java.io.IOException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
-
-import static org.apache.hadoop.hdds.scm.HddsServerUtil.getScmHeartbeatInterval;
 
 /**
  * State Machine Class.
@@ -60,7 +70,6 @@ public class DatanodeStateMachine implements Closeable {
   private final ExecutorService executorService;
   private final Configuration conf;
   private final SCMConnectionManager connectionManager;
-  private final long heartbeatFrequency;
   private StateContext context;
   private final OzoneContainer container;
   private DatanodeDetails datanodeDetails;
@@ -70,6 +79,9 @@ public class DatanodeStateMachine implements Closeable {
   private AtomicLong nextHB;
   private Thread stateMachineThread = null;
   private Thread cmdProcessThread = null;
+  private final ReplicationSupervisor supervisor;
+
+  private JvmPauseMonitor jvmPauseMonitor;
 
   /**
    * Constructs a a datanode state machine.
@@ -86,19 +98,26 @@ public class DatanodeStateMachine implements Closeable {
             .setNameFormat("Datanode State Machine Thread - %d").build());
     connectionManager = new SCMConnectionManager(conf);
     context = new StateContext(this.conf, DatanodeStates.getInitState(), this);
-    heartbeatFrequency = TimeUnit.SECONDS.toMillis(
-        getScmHeartbeatInterval(conf));
     container = new OzoneContainer(this.datanodeDetails,
         new OzoneConfiguration(conf), context);
     nextHB = new AtomicLong(Time.monotonicNow());
 
-     // When we add new handlers just adding a new handler here should do the
+    ContainerReplicator replicator =
+        new DownloadAndImportReplicator(container.getContainerSet(),
+            container.getController(),
+            new SimpleContainerDownloader(conf), new TarContainerPacker());
+
+    supervisor =
+        new ReplicationSupervisor(container.getContainerSet(), replicator, 10);
+
+    // When we add new handlers just adding a new handler here should do the
      // trick.
     commandDispatcher = CommandDispatcher.newBuilder()
         .addHandler(new CloseContainerCommandHandler())
         .addHandler(new DeleteBlocksCommandHandler(container.getContainerSet(),
             conf))
-        .addHandler(new ReplicateContainerCommandHandler())
+        .addHandler(new ReplicateContainerCommandHandler(conf, supervisor))
+        .addHandler(new DeleteContainerCommandHandler())
         .setConnectionManager(connectionManager)
         .setContainer(container)
         .setContext(context)
@@ -109,6 +128,7 @@ public class DatanodeStateMachine implements Closeable {
         .addPublisherFor(NodeReportProto.class)
         .addPublisherFor(ContainerReportsProto.class)
         .addPublisherFor(CommandStatusReportsProto.class)
+        .addPublisherFor(PipelineReportsProto.class)
         .build();
   }
 
@@ -145,18 +165,29 @@ public class DatanodeStateMachine implements Closeable {
     container.start();
     reportManager.init();
     initCommandHandlerThread(conf);
+
+    // Start jvm monitor
+    jvmPauseMonitor = new JvmPauseMonitor();
+    jvmPauseMonitor.init(conf);
+    jvmPauseMonitor.start();
+
     while (context.getState() != DatanodeStates.SHUTDOWN) {
       try {
         LOG.debug("Executing cycle Number : {}", context.getExecutionCount());
+        long heartbeatFrequency = context.getHeartbeatFrequency();
         nextHB.set(Time.monotonicNow() + heartbeatFrequency);
         context.execute(executorService, heartbeatFrequency,
             TimeUnit.MILLISECONDS);
         now = Time.monotonicNow();
         if (now < nextHB.get()) {
-          Thread.sleep(nextHB.get() - now);
+          if(!Thread.interrupted()) {
+            Thread.sleep(nextHB.get() - now);
+          }
         }
       } catch (InterruptedException e) {
-        // Ignore this exception.
+        // Some one has sent interrupt signal, this could be because
+        // 1. Trigger heartbeat immediately
+        // 2. Shutdown has be initiated.
       } catch (Exception e) {
         LOG.error("Unable to finish the execution.", e);
       }
@@ -222,6 +253,10 @@ public class DatanodeStateMachine implements Closeable {
 
     if(container != null) {
       container.stop();
+    }
+
+    if (jvmPauseMonitor != null) {
+      jvmPauseMonitor.stop();
     }
   }
 
@@ -310,6 +345,15 @@ public class DatanodeStateMachine implements Closeable {
   }
 
   /**
+   * Calling this will immediately trigger a heartbeat to the SCMs.
+   * This heartbeat will also include all the reports which are ready to
+   * be sent by datanode.
+   */
+  public void triggerHeartbeat() {
+    stateMachineThread.interrupt();
+  }
+
+  /**
    * Waits for DatanodeStateMachine to exit.
    *
    * @throws InterruptedException
@@ -324,6 +368,7 @@ public class DatanodeStateMachine implements Closeable {
    */
   public synchronized void stopDaemon() {
     try {
+      supervisor.stop();
       context.setState(DatanodeStates.SHUTDOWN);
       reportManager.shutdown();
       this.close();

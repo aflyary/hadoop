@@ -25,25 +25,25 @@ import java.util.List;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.
     ContainerType;
-import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.
-    ContainerLifeCycleState;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
+    .ContainerDataProto;
 import org.apache.hadoop.ozone.container.common.helpers.ContainerUtils;
 import org.apache.hadoop.ozone.container.common.volume.HddsVolume;
 
 import java.util.Collections;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import org.yaml.snakeyaml.Yaml;
 
-import static java.lang.Math.max;
 import static org.apache.hadoop.ozone.OzoneConsts.CHECKSUM;
 import static org.apache.hadoop.ozone.OzoneConsts.CONTAINER_ID;
 import static org.apache.hadoop.ozone.OzoneConsts.CONTAINER_TYPE;
 import static org.apache.hadoop.ozone.OzoneConsts.LAYOUTVERSION;
-import static org.apache.hadoop.ozone.OzoneConsts.MAX_SIZE_GB;
+import static org.apache.hadoop.ozone.OzoneConsts.MAX_SIZE;
 import static org.apache.hadoop.ozone.OzoneConsts.METADATA;
+import static org.apache.hadoop.ozone.OzoneConsts.ORIGIN_NODE_ID;
+import static org.apache.hadoop.ozone.OzoneConsts.ORIGIN_PIPELINE_ID;
 import static org.apache.hadoop.ozone.OzoneConsts.STATE;
 
 /**
@@ -67,9 +67,14 @@ public abstract class ContainerData {
   private final Map<String, String> metadata;
 
   // State of the Container
-  private ContainerLifeCycleState state;
+  private ContainerDataProto.State state;
 
-  private final int maxSizeGB;
+  private final long maxSize;
+
+  //ID of the pipeline where this container is created
+  private String originPipelineId;
+  //ID of the datanode where this container is created
+  private String originNodeId;
 
   /** parameters for read/write statistics on the container. **/
   private final AtomicLong readBytes;
@@ -80,8 +85,6 @@ public abstract class ContainerData {
   private final AtomicLong keyCount;
 
   private HddsVolume volume;
-
-  private long deleteTransactionId;
 
   private String checksum;
   public static final Charset CHARSET_ENCODING = Charset.forName("UTF-8");
@@ -96,24 +99,23 @@ public abstract class ContainerData {
       LAYOUTVERSION,
       STATE,
       METADATA,
-      MAX_SIZE_GB,
-      CHECKSUM));
-
-
-  /**
-   * Number of pending deletion blocks in container.
-   */
-  private final AtomicInteger numPendingDeletionBlocks;
+      MAX_SIZE,
+      CHECKSUM,
+      ORIGIN_PIPELINE_ID,
+      ORIGIN_NODE_ID));
 
   /**
    * Creates a ContainerData Object, which holds metadata of the container.
    * @param type - ContainerType
    * @param containerId - ContainerId
-   * @param size - container maximum size
+   * @param size - container maximum size in bytes
+   * @param originPipelineId - Pipeline Id where this container is/was created
+   * @param originNodeId - Node Id where this container is/was created
    */
-  protected ContainerData(ContainerType type, long containerId, int size) {
-    this(type, containerId,
-        ChunkLayOutVersion.getLatestVersion().getVersion(), size);
+  protected ContainerData(ContainerType type, long containerId, long size,
+                          String originPipelineId, String originNodeId) {
+    this(type, containerId, ChunkLayOutVersion.getLatestVersion().getVersion(),
+        size, originPipelineId, originNodeId);
   }
 
   /**
@@ -121,26 +123,29 @@ public abstract class ContainerData {
    * @param type - ContainerType
    * @param containerId - ContainerId
    * @param layOutVersion - Container layOutVersion
-   * @param size - Container maximum size
+   * @param size - Container maximum size in bytes
+   * @param originPipelineId - Pipeline Id where this container is/was created
+   * @param originNodeId - Node Id where this container is/was created
    */
   protected ContainerData(ContainerType type, long containerId,
-    int layOutVersion, int size) {
+      int layOutVersion, long size, String originPipelineId,
+      String originNodeId) {
     Preconditions.checkNotNull(type);
 
     this.containerType = type;
     this.containerID = containerId;
     this.layOutVersion = layOutVersion;
     this.metadata = new TreeMap<>();
-    this.state = ContainerLifeCycleState.OPEN;
+    this.state = ContainerDataProto.State.OPEN;
     this.readCount = new AtomicLong(0L);
     this.readBytes =  new AtomicLong(0L);
     this.writeCount =  new AtomicLong(0L);
     this.writeBytes =  new AtomicLong(0L);
     this.bytesUsed = new AtomicLong(0L);
     this.keyCount = new AtomicLong(0L);
-    this.maxSizeGB = size;
-    this.numPendingDeletionBlocks = new AtomicInteger(0);
-    this.deleteTransactionId = 0;
+    this.maxSize = size;
+    this.originPipelineId = originPipelineId;
+    this.originNodeId = originNodeId;
     setChecksumTo0ByteArray();
   }
 
@@ -170,7 +175,7 @@ public abstract class ContainerData {
    * Returns the state of the container.
    * @return ContainerLifeCycleState
    */
-  public synchronized ContainerLifeCycleState getState() {
+  public synchronized ContainerDataProto.State getState() {
     return state;
   }
 
@@ -178,16 +183,16 @@ public abstract class ContainerData {
    * Set the state of the container.
    * @param state
    */
-  public synchronized void setState(ContainerLifeCycleState state) {
+  public synchronized void setState(ContainerDataProto.State state) {
     this.state = state;
   }
 
   /**
-   * Return's maximum size of the container in GB.
-   * @return maxSizeGB
+   * Return's maximum size of the container in bytes.
+   * @return maxSize in bytes
    */
-  public int getMaxSizeGB() {
-    return maxSizeGB;
+  public long getMaxSize() {
+    return maxSize;
   }
 
   /**
@@ -234,7 +239,7 @@ public abstract class ContainerData {
    * @return - boolean
    */
   public synchronized  boolean isOpen() {
-    return ContainerLifeCycleState.OPEN == state;
+    return ContainerDataProto.State.OPEN == state;
   }
 
   /**
@@ -242,23 +247,37 @@ public abstract class ContainerData {
    * @return - boolean
    */
   public synchronized boolean isValid() {
-    return !(ContainerLifeCycleState.INVALID == state);
+    return !(ContainerDataProto.State.INVALID == state);
   }
 
   /**
    * checks if the container is closed.
    * @return - boolean
    */
-  public synchronized  boolean isClosed() {
-    return ContainerLifeCycleState.CLOSED == state;
+  public synchronized boolean isClosed() {
+    return ContainerDataProto.State.CLOSED == state;
+  }
+
+  /**
+   * checks if the container is quasi closed.
+   * @return - boolean
+   */
+  public synchronized boolean isQuasiClosed() {
+    return ContainerDataProto.State.QUASI_CLOSED == state;
+  }
+
+  /**
+   * Marks this container as quasi closed.
+   */
+  public synchronized void quasiCloseContainer() {
+    setState(ContainerDataProto.State.QUASI_CLOSED);
   }
 
   /**
    * Marks this container as closed.
    */
   public synchronized void closeContainer() {
-    // TODO: closed or closing here
-    setState(ContainerLifeCycleState.CLOSED);
+    setState(ContainerDataProto.State.CLOSED);
   }
 
   /**
@@ -404,31 +423,6 @@ public abstract class ContainerData {
     this.keyCount.set(count);
   }
 
-  /**
-   * Increase the count of pending deletion blocks.
-   *
-   * @param numBlocks increment number
-   */
-  public void incrPendingDeletionBlocks(int numBlocks) {
-    this.numPendingDeletionBlocks.addAndGet(numBlocks);
-  }
-
-  /**
-   * Decrease the count of pending deletion blocks.
-   *
-   * @param numBlocks decrement number
-   */
-  public void decrPendingDeletionBlocks(int numBlocks) {
-    this.numPendingDeletionBlocks.addAndGet(-1 * numBlocks);
-  }
-
-  /**
-   * Get the number of pending deletion blocks.
-   */
-  public int getNumPendingDeletionBlocks() {
-    return this.numPendingDeletionBlocks.get();
-  }
-
   public void setChecksumTo0ByteArray() {
     this.checksum = DUMMY_CHECKSUM;
   }
@@ -439,6 +433,23 @@ public abstract class ContainerData {
 
   public String getChecksum() {
     return this.checksum;
+  }
+
+
+  /**
+   * Returns the origin pipeline Id of this container.
+   * @return origin node Id
+   */
+  public String getOriginPipelineId() {
+    return originPipelineId;
+  }
+
+  /**
+   * Returns the origin node Id of this container.
+   * @return origin node Id
+   */
+  public String getOriginNodeId() {
+    return originNodeId;
   }
 
   /**
@@ -469,21 +480,5 @@ public abstract class ContainerData {
    *
    * @return Protocol Buffer Message
    */
-  public abstract ContainerProtos.ContainerData getProtoBufMessage();
-
-  /**
-   * Sets deleteTransactionId to latest delete transactionId for the container.
-   *
-   * @param transactionId latest transactionId of the container.
-   */
-  public void updateDeleteTransactionId(long transactionId) {
-    deleteTransactionId = max(transactionId, deleteTransactionId);
-  }
-
-  /**
-   * Return the latest deleteTransactionId of the container.
-   */
-  public long getDeleteTransactionId() {
-    return deleteTransactionId;
-  }
+  public abstract ContainerProtos.ContainerDataProto getProtoBufMessage();
 }

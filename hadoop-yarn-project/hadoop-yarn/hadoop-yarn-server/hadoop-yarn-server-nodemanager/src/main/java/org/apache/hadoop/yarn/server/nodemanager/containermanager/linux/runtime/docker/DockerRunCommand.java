@@ -104,6 +104,11 @@ public class DockerRunCommand extends DockerCommand {
     return this;
   }
 
+  public DockerRunCommand addTmpfsMount(String mount) {
+    super.addCommandArguments("tmpfs", mount);
+    return this;
+  }
+
   public DockerRunCommand setVolumeDriver(String volumeDriver) {
     super.addCommandArguments("volume-driver", volumeDriver);
     return this;
@@ -151,6 +156,17 @@ public class DockerRunCommand extends DockerCommand {
 
   public DockerRunCommand disableDetach() {
     super.addCommandArguments("detach", "false");
+    return this;
+  }
+
+  /* Ports mapping for bridge network, -p */
+  public DockerRunCommand addPortsMapping(String mapping) {
+    super.addCommandArguments("ports-mapping", mapping);
+    return this;
+  }
+
+  public DockerRunCommand addRuntime(String runtime) {
+    super.addCommandArguments("runtime", runtime);
     return this;
   }
 
@@ -211,5 +227,11 @@ public class DockerRunCommand extends DockerCommand {
    */
   public final void addEnv(Map<String, String> environment) {
     userEnv.putAll(environment);
+  }
+
+  public DockerRunCommand setYarnSysFS(boolean toggle) {
+    String value = Boolean.toString(toggle);
+    super.addCommandArguments("use-yarn-sysfs", value);
+    return this;
   }
 }

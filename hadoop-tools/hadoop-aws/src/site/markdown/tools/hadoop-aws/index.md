@@ -31,9 +31,11 @@ See also:
 * [Committing work to S3 with the "S3A Committers"](./committers.html)
 * [S3A Committers Architecture](./committer_architecture.html)
 * [Working with IAM Assumed Roles](./assumed_roles.html)
+* [S3A Delegation Token Support](./delegation_tokens.html)
+* [S3A Delegation Token Architecture](delegation_token_architecture.html).
 * [Testing](./testing.html)
 
-##<a name="overview"></a> Overview
+## <a name="overview"></a> Overview
 
 Apache Hadoop's `hadoop-aws` module provides support for AWS integration.
 applications to easily use this support.
@@ -88,7 +90,7 @@ maintain it.
    This connector is no longer available: users must migrate to the newer `s3a:` client.
 
 
-##<a name="getting_started"></a> Getting Started
+## <a name="getting_started"></a> Getting Started
 
 S3A depends upon two JARs, alongside `hadoop-common` and its dependencies.
 
@@ -197,7 +199,7 @@ to safely save the output of queries directly into S3 object stores
 through the S3A filesystem.
 
 
-### Warning #3: Object stores have differerent authorization models
+### Warning #3: Object stores have different authorization models
 
 The object authorization model of S3 is much different from the file
 authorization model of HDFS and traditional file systems.
@@ -222,13 +224,12 @@ Your AWS credentials not only pay for services, they offer read and write
 access to the data. Anyone with the credentials can not only read your datasets
 —they can delete them.
 
-Do not inadvertently share these credentials through means such as
+Do not inadvertently share these credentials through means such as:
 
 1. Checking in to SCM any configuration files containing the secrets.
 1. Logging them to a console, as they invariably end up being seen.
-1. Defining filesystem URIs with the credentials in the URL, such as
-`s3a://AK0010:secret@landsat-pds/`. They will end up in logs and error messages.
 1. Including the secrets in bug reports.
+1. Logging the `AWS_` environment variables.
 
 If you do any of these: change your credentials immediately!
 
@@ -241,6 +242,11 @@ needs the credentials needed to interact with buckets.
 The client supports multiple authentication mechanisms and can be configured as to
 which mechanisms to use, and their order of use. Custom implementations
 of `com.amazonaws.auth.AWSCredentialsProvider` may also be used.
+
+*Important*: The S3A connector no longer supports username and secrets
+in URLs of the form `s3a://key:secret@bucket/`.
+It is near-impossible to stop those secrets being logged —which is why
+a warning has been printed since Hadoop 2.8 whenever such a URL was used.
 
 ### Authentication properties
 
@@ -281,9 +287,8 @@ of `com.amazonaws.auth.AWSCredentialsProvider` may also be used.
 
     If unspecified, then the default list of credential provider classes,
     queried in sequence, is:
-    1. org.apache.hadoop.fs.s3a.BasicAWSCredentialsProvider: supports
-        static configuration of AWS access key ID and secret access key.
-        See also fs.s3a.access.key and fs.s3a.secret.key.
+    1. org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider:
+       Uses the values of fs.s3a.access.key and fs.s3a.secret.key.
     2. com.amazonaws.auth.EnvironmentVariableCredentialsProvider: supports
         configuration of AWS access key ID and secret access key in
         environment variables named AWS_ACCESS_KEY_ID and
@@ -335,17 +340,20 @@ on the hosts/processes where the work is executed.
 
 ### <a name="auth_providers"></a> Changing Authentication Providers
 
-The standard way to authenticate is with an access key and secret key using the
-properties in the configuration file.
+The standard way to authenticate is with an access key and secret key set in
+the Hadoop configuration files.
 
-The S3A client follows the following authentication chain:
+By default, the S3A client follows the following authentication chain:
 
-1. If login details were provided in the filesystem URI, a warning is printed
-and then the username and password extracted for the AWS key and secret respectively.
+1. The options `fs.s3a.access.key`, `fs.s3a.secret.key` and `fs.s3a.sesson.key
+are looked for in the Hadoop XML configuration/Hadoop credential providers,
+returning a set of session credentials if all three are defined.
 1. The `fs.s3a.access.key` and `fs.s3a.secret.key` are looked for in the Hadoop
-XML configuration.
+XML configuration//Hadoop credential providers, returning a set of long-lived
+credentials if they are defined.
 1. The [AWS environment variables](http://docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html#cli-environment),
-are then looked for.
+are then looked for: these will return session or full credentials depending
+on which values are set.
 1. An attempt is made to query the Amazon EC2 Instance Metadata Service to
  retrieve credentials published to EC2 VMs.
 
@@ -361,13 +369,19 @@ AWS Credential Providers are classes which can be used by the Amazon AWS SDK to
 obtain an AWS login from a different source in the system, including environment
 variables, JVM properties and configuration files.
 
-There are three AWS Credential Providers inside the `hadoop-aws` JAR:
+All Hadoop `fs.s3a.` options used to store login details can all be secured
+in [Hadoop credential providers](../../../hadoop-project-dist/hadoop-common/CredentialProviderAPI.html);
+this is advised as a more secure way to store valuable secrets.
+
+There are a number of AWS Credential Providers inside the `hadoop-aws` JAR:
 
 | classname | description |
 |-----------|-------------|
 | `org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider`| Session Credentials |
 | `org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider`| Simple name/secret credentials |
 | `org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider`| Anonymous Login |
+| `org.apache.hadoop.fs.s3a.auth.AssumedRoleCredentialProvider<`| [Assumed Role credentials](assumed_roles.html) |
+
 
 There are also many in the Amazon SDKs, in particular two which are automatically
 set up in the authentication chain:
@@ -461,12 +475,11 @@ security and therefore is unsuitable for most use cases.
 then the Anonymous Credential provider *must* come last. If not, credential
 providers listed after it will be ignored.
 
-*Simple name/secret credentials with `SimpleAWSCredentialsProvider`*
+### <a name="auth_simple"></a> Simple name/secret credentials with `SimpleAWSCredentialsProvider`*
 
-This is is the standard credential provider, which
-supports the secret key in `fs.s3a.access.key` and token in `fs.s3a.secret.key`
-values. It does not support authentication with logins credentials declared
-in the URLs.
+This is is the standard credential provider, which supports the secret
+key in `fs.s3a.access.key` and token in `fs.s3a.secret.key`
+values.
 
 ```xml
 <property>
@@ -475,9 +488,7 @@ in the URLs.
 </property>
 ```
 
-Apart from its lack of support of user:password details being included in filesystem
-URLs (a dangerous practise that is strongly discouraged), this provider acts
-exactly at the basic authenticator used in the default authentication chain.
+This is the basic authenticator used in the default authentication chain.
 
 This means that the default S3A authentication chain can be defined as
 
@@ -485,10 +496,52 @@ This means that the default S3A authentication chain can be defined as
 <property>
   <name>fs.s3a.aws.credentials.provider</name>
   <value>
-  org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider,
-  com.amazonaws.auth.EnvironmentVariableCredentialsProvider,
-  com.amazonaws.auth.InstanceProfileCredentialsProvider
+    org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider,
+    org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider,
+    com.amazonaws.auth.EnvironmentVariableCredentialsProvider,
+    org.apache.hadoop.fs.s3a.auth.IAMInstanceCredentialsProvider
   </value>
+  <description>
+    Comma-separated class names of credential provider classes which implement
+    com.amazonaws.auth.AWSCredentialsProvider.
+
+    When S3A delegation tokens are not enabled, this list will be used
+    to directly authenticate with S3 and DynamoDB services.
+    When S3A Delegation tokens are enabled, depending upon the delegation
+    token binding it may be used
+    to communicate wih the STS endpoint to request session/role
+    credentials.
+
+    These are loaded and queried in sequence for a valid set of credentials.
+    Each listed class must implement one of the following means of
+    construction, which are attempted in order:
+    * a public constructor accepting java.net.URI and
+        org.apache.hadoop.conf.Configuration,
+    * a public constructor accepting org.apache.hadoop.conf.Configuration,
+    * a public static method named getInstance that accepts no
+       arguments and returns an instance of
+       com.amazonaws.auth.AWSCredentialsProvider, or
+    * a public default constructor.
+
+    Specifying org.apache.hadoop.fs.s3a.AnonymousAWSCredentialsProvider allows
+    anonymous access to a publicly accessible S3 bucket without any credentials.
+    Please note that allowing anonymous access to an S3 bucket compromises
+    security and therefore is unsuitable for most use cases. It can be useful
+    for accessing public data sets without requiring AWS credentials.
+
+    If unspecified, then the default list of credential provider classes,
+    queried in sequence, is:
+    * org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider: looks
+       for session login secrets in the Hadoop configuration.
+    * org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider:
+       Uses the values of fs.s3a.access.key and fs.s3a.secret.key.
+    * com.amazonaws.auth.EnvironmentVariableCredentialsProvider: supports
+        configuration of AWS access key ID and secret access key in
+        environment variables named AWS_ACCESS_KEY_ID and
+        AWS_SECRET_ACCESS_KEY, as documented in the AWS SDK.
+    * com.amazonaws.auth.InstanceProfileCredentialsProvider: supports use
+        of instance profile credentials if running in an EC2 VM.
+  </description>
 </property>
 ```
 
@@ -502,9 +555,6 @@ and significantly damage your organisation.
 
 1. Never commit your secrets into an SCM repository.
 The [git secrets](https://github.com/awslabs/git-secrets) can help here.
-
-1. Avoid using s3a URLs which have key and secret in the URL. This
-is dangerous as the secrets leak into the logs.
 
 1. Never include AWS credentials in bug reports, files attached to them,
 or similar.
@@ -526,20 +576,23 @@ The command line of any launched program is visible to all users on a Unix syste
 management: a specific S3A connection can be made with a different assumed role
 and permissions from the primary user account.
 
-1. Consider a workflow in which usera and applications are issued with short-lived
+1. Consider a workflow in which users and applications are issued with short-lived
 session credentials, configuring S3A to use these through
 the `TemporaryAWSCredentialsProvider`.
 
 1. Have a secure process in place for cancelling and re-issuing credentials for
 users and applications. Test it regularly by using it to refresh credentials.
 
+1. In installations where Kerberos is enabled, [S3A Delegation Tokens](delegation_tokens.html)
+can be used to acquire short-lived session/role credentials and then pass them
+into the shared application. This can ensure that the long-lived secrets stay
+on the local system.
+
 When running in EC2, the IAM EC2 instance credential provider will automatically
 obtain the credentials needed to access AWS services in the role the EC2 VM
 was deployed as.
-This credential provider is enabled in S3A by default.
+This AWS credential provider is enabled in S3A by default.
 
-The safest way to keep the AWS login keys a secret within Hadoop is to use
-Hadoop Credentials.
 
 ## <a name="hadoop_credential_providers"></a>Storing secrets with Hadoop Credential Providers
 
@@ -1698,6 +1751,6 @@ as configured by the value `fs.s3a.multipart.size`.
 To disable checksum verification in `distcp`, use the `-skipcrccheck` option:
 
 ```bash
-hadoop distcp -update -skipcrccheck /user/alice/datasets s3a://alice-backup/datasets
+hadoop distcp -update -skipcrccheck -numListstatusThreads 40 /user/alice/datasets s3a://alice-backup/datasets
 ```
 

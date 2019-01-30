@@ -18,6 +18,8 @@
 
 package org.apache.hadoop.fs.s3a;
 
+import java.time.Duration;
+
 /**
  * Constants for S3A Testing.
  */
@@ -106,6 +108,11 @@ public interface S3ATestConstants {
   String KEY_HUGE_PARTITION_SIZE = S3A_SCALE_TEST + "huge.partitionsize";
 
   /**
+   * Size of partitions to upload: {@value}.
+   */
+  String DEFAULT_HUGE_PARTITION_SIZE = "8M";
+
+  /**
    * The default huge size is small —full 5GB+ scale tests are something
    * to run in long test runs on EC2 VMs. {@value}.
    */
@@ -132,6 +139,12 @@ public interface S3ATestConstants {
    */
   String TEST_UNIQUE_FORK_ID = "test.unique.fork.id";
   String TEST_STS_ENABLED = "test.fs.s3a.sts.enabled";
+
+  /**
+   * Endpoint for STS testing.
+   * @deprecated : Use {@link Constants#ASSUMED_ROLE_STS_ENDPOIN}
+   */
+  @Deprecated
   String TEST_STS_ENDPOINT = "test.fs.s3a.sts.endpoint";
 
   /**
@@ -168,4 +181,16 @@ public interface S3ATestConstants {
    */
   String FS_S3A_IMPL_DISABLE_CACHE
       = "fs.s3a.impl.disable.cache";
+
+  /**
+   * Duration in seconds for role/session token requests: {@value}.
+   */
+  int TEST_SESSION_TOKEN_DURATION_SECONDS = 900;
+
+  /**
+   * Test session duration as a java 8 Duration.
+   */
+  Duration TEST_SESSION_TOKEN_DURATION = Duration.ofSeconds(
+      TEST_SESSION_TOKEN_DURATION_SECONDS);
+
 }

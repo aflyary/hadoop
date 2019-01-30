@@ -17,21 +17,26 @@
  */
 package org.apache.hadoop.ozone.om.helpers;
 
-import com.google.common.base.Preconditions;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.stream.Collectors;
+
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.KeyInfo;
 import org.apache.hadoop.util.Time;
 
-import java.io.IOException;
-import java.util.List;
-import java.util.stream.Collectors;
+import com.google.common.base.Preconditions;
 
 /**
  * Args for key block. The block instance for the key requested in putKey.
  * This is returned from OM to client, and client use class to talk to
  * datanode. Also, this is the metadata written to om.db on server side.
  */
-public final class OmKeyInfo {
+public final class OmKeyInfo extends WithMetadata {
   private final String volumeName;
   private final String bucketName;
   // name of key client specified
@@ -43,10 +48,13 @@ public final class OmKeyInfo {
   private HddsProtos.ReplicationType type;
   private HddsProtos.ReplicationFactor factor;
 
-  private OmKeyInfo(String volumeName, String bucketName, String keyName,
-                    List<OmKeyLocationInfoGroup> versions, long dataSize,
-                    long creationTime, long modificationTime, HddsProtos.ReplicationType type,
-                    HddsProtos.ReplicationFactor factor) {
+  @SuppressWarnings("parameternumber")
+  OmKeyInfo(String volumeName, String bucketName, String keyName,
+      List<OmKeyLocationInfoGroup> versions, long dataSize,
+      long creationTime, long modificationTime,
+      HddsProtos.ReplicationType type,
+      HddsProtos.ReplicationFactor factor,
+      Map<String, String> metadata) {
     this.volumeName = volumeName;
     this.bucketName = bucketName;
     this.keyName = keyName;
@@ -67,6 +75,7 @@ public final class OmKeyInfo {
     this.modificationTime = modificationTime;
     this.factor = factor;
     this.type = type;
+    this.metadata = metadata;
   }
 
   public String getVolumeName() {
@@ -119,25 +128,25 @@ public final class OmKeyInfo {
    * This will be called when the key is being committed to OzoneManager.
    *
    * @param locationInfoList list of locationInfo
-   * @throws IOException
    */
   public void updateLocationInfoList(List<OmKeyLocationInfo> locationInfoList) {
+    long latestVersion = getLatestVersionLocations().getVersion();
     OmKeyLocationInfoGroup keyLocationInfoGroup = getLatestVersionLocations();
     List<OmKeyLocationInfo> currentList =
         keyLocationInfoGroup.getLocationList();
-    Preconditions.checkNotNull(keyLocationInfoGroup);
-    Preconditions.checkState(locationInfoList.size() <= currentList.size());
-    for (OmKeyLocationInfo current : currentList) {
-      // For Versioning, while committing the key for the newer version,
-      // we just need to update the lengths for new blocks. Need to iterate over
-      // and find the new blocks added in the latest version.
-      for (OmKeyLocationInfo info : locationInfoList) {
-        if (info.getBlockID().equals(current.getBlockID())) {
-          current.setLength(info.getLength());
-          break;
-        }
-      }
-    }
+    List<OmKeyLocationInfo> latestVersionList =
+        keyLocationInfoGroup.getBlocksLatestVersionOnly();
+    // Updates the latest locationList in the latest version only with
+    // given locationInfoList here.
+    // TODO : The original allocated list and the updated list here may vary
+    // as the containers on the Datanode on which the blocks were pre allocated
+    // might get closed. The diff of blocks between these two lists here
+    // need to be garbage collected in case the ozone client dies.
+    currentList.removeAll(latestVersionList);
+    // set each of the locationInfo object to the latest version
+    locationInfoList.stream().forEach(omKeyLocationInfo -> omKeyLocationInfo
+        .setCreateVersion(latestVersion));
+    currentList.addAll(locationInfoList);
   }
 
   /**
@@ -206,11 +215,19 @@ public final class OmKeyInfo {
     private String bucketName;
     private String keyName;
     private long dataSize;
-    private List<OmKeyLocationInfoGroup> omKeyLocationInfoGroups;
+    private List<OmKeyLocationInfoGroup> omKeyLocationInfoGroups =
+        new ArrayList<>();
     private long creationTime;
     private long modificationTime;
     private HddsProtos.ReplicationType type;
     private HddsProtos.ReplicationFactor factor;
+    private boolean isMultipartKey;
+    private Map<String, String> metadata;
+
+    public Builder() {
+      this.metadata = new HashMap<>();
+      omKeyLocationInfoGroups = new ArrayList<>();
+    }
 
     public Builder setVolumeName(String volume) {
       this.volumeName = volume;
@@ -248,20 +265,35 @@ public final class OmKeyInfo {
       return this;
     }
 
-    public Builder setReplicationFactor(HddsProtos.ReplicationFactor factor) {
-      this.factor = factor;
+    public Builder setReplicationFactor(HddsProtos.ReplicationFactor replFact) {
+      this.factor = replFact;
       return this;
     }
 
-    public Builder setReplicationType(HddsProtos.ReplicationType type) {
-      this.type = type;
+    public Builder setReplicationType(HddsProtos.ReplicationType replType) {
+      this.type = replType;
+      return this;
+    }
+
+    public Builder setIsMultipartKey(boolean isMultipart) {
+      this.isMultipartKey = isMultipart;
+      return this;
+    }
+
+    public Builder addMetadata(String key, String value) {
+      metadata.put(key, value);
+      return this;
+    }
+
+    public Builder addAllMetadata(Map<String, String> newMetadata) {
+      metadata.putAll(newMetadata);
       return this;
     }
 
     public OmKeyInfo build() {
       return new OmKeyInfo(
           volumeName, bucketName, keyName, omKeyLocationInfoGroups,
-          dataSize, creationTime, modificationTime, type, factor);
+          dataSize, creationTime, modificationTime, type, factor, metadata);
     }
   }
 
@@ -281,6 +313,7 @@ public final class OmKeyInfo {
         .setLatestVersion(latestVersion)
         .setCreationTime(creationTime)
         .setModificationTime(modificationTime)
+        .addAllMetadata(KeyValueUtil.toProtobuf(metadata))
         .build();
   }
 
@@ -296,7 +329,34 @@ public final class OmKeyInfo {
         keyInfo.getCreationTime(),
         keyInfo.getModificationTime(),
         keyInfo.getType(),
-        keyInfo.getFactor());
+        keyInfo.getFactor(),
+        KeyValueUtil.getFromProtobuf(keyInfo.getMetadataList()));
   }
 
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    OmKeyInfo omKeyInfo = (OmKeyInfo) o;
+    return dataSize == omKeyInfo.dataSize &&
+        creationTime == omKeyInfo.creationTime &&
+        modificationTime == omKeyInfo.modificationTime &&
+        volumeName.equals(omKeyInfo.volumeName) &&
+        bucketName.equals(omKeyInfo.bucketName) &&
+        keyName.equals(omKeyInfo.keyName) &&
+        Objects
+            .equals(keyLocationVersions, omKeyInfo.keyLocationVersions) &&
+        type == omKeyInfo.type &&
+        factor == omKeyInfo.factor &&
+        Objects.equals(metadata, omKeyInfo.metadata);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(volumeName, bucketName, keyName);
+  }
 }

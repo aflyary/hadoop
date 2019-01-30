@@ -28,26 +28,33 @@ import com.google.common.cache.RemovalListener;
 import com.google.common.cache.RemovalNotification;
 import com.google.protobuf.BlockingService;
 import org.apache.hadoop.classification.InterfaceAudience;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.HddsUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeState;
+import org.apache.hadoop.hdds.scm.HddsServerUtil;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.block.BlockManager;
 import org.apache.hadoop.hdds.scm.block.BlockManagerImpl;
+import org.apache.hadoop.hdds.scm.block.DeletedBlockLogImpl;
+import org.apache.hadoop.hdds.scm.block.PendingDeleteHandler;
+import org.apache.hadoop.hdds.scm.chillmode.SCMChillModeManager;
 import org.apache.hadoop.hdds.scm.command.CommandStatusReportHandler;
 import org.apache.hadoop.hdds.scm.container.CloseContainerEventHandler;
 import org.apache.hadoop.hdds.scm.container.ContainerActionsHandler;
-import org.apache.hadoop.hdds.scm.container.ContainerMapping;
+import org.apache.hadoop.hdds.scm.container.ContainerID;
+import org.apache.hadoop.hdds.scm.container.ContainerInfo;
+import org.apache.hadoop.hdds.scm.container.ContainerManager;
 import org.apache.hadoop.hdds.scm.container.ContainerReportHandler;
-import org.apache.hadoop.hdds.scm.container.Mapping;
-import org.apache.hadoop.hdds.scm.container.replication.ReplicationManager;
-import org.apache.hadoop.hdds.scm.container.common.helpers.ContainerInfo;
-import org.apache.hadoop.hdds.scm.container.placement.algorithms
-    .ContainerPlacementPolicy;
-import org.apache.hadoop.hdds.scm.container.placement.algorithms
-    .SCMContainerPlacementCapacity;
+import org.apache.hadoop.hdds.scm.container.IncrementalContainerReportHandler;
+import org.apache.hadoop.hdds.scm.container.SCMContainerManager;
+import org.apache.hadoop.hdds.scm.container.placement.algorithms.ContainerPlacementPolicy;
+import org.apache.hadoop.hdds.scm.container.placement.algorithms.SCMContainerPlacementCapacity;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.ContainerStat;
 import org.apache.hadoop.hdds.scm.container.placement.metrics.SCMMetrics;
+import org.apache.hadoop.hdds.scm.container.replication.ReplicationActivityStatus;
+import org.apache.hadoop.hdds.scm.container.replication.ReplicationManager;
 import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException;
 import org.apache.hadoop.hdds.scm.exceptions.SCMException.ResultCodes;
@@ -57,8 +64,15 @@ import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.scm.node.NodeReportHandler;
 import org.apache.hadoop.hdds.scm.node.SCMNodeManager;
 import org.apache.hadoop.hdds.scm.node.StaleNodeHandler;
-import org.apache.hadoop.hdds.scm.node.states.Node2ContainerMap;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineActionHandler;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineManager;
+import org.apache.hadoop.hdds.scm.pipeline.PipelineReportHandler;
+import org.apache.hadoop.hdds.scm.pipeline.SCMPipelineManager;
+import org.apache.hadoop.hdds.security.x509.SecurityConfig;
+import org.apache.hadoop.hdds.security.x509.certificate.authority.CertificateServer;
+import org.apache.hadoop.hdds.security.x509.certificate.authority.DefaultCAServer;
 import org.apache.hadoop.hdds.server.ServiceRuntimeInfoImpl;
+import org.apache.hadoop.hdds.server.events.EventPublisher;
 import org.apache.hadoop.hdds.server.events.EventQueue;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.io.IOUtils;
@@ -66,21 +80,26 @@ import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
+import org.apache.hadoop.ozone.OzoneSecurityUtil;
 import org.apache.hadoop.ozone.common.Storage.StorageState;
 import org.apache.hadoop.ozone.common.StorageInfo;
 import org.apache.hadoop.ozone.lease.LeaseManager;
+import org.apache.hadoop.ozone.protocol.commands.RetriableDatanodeEventWatcher;
+import org.apache.hadoop.security.SecurityUtil;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod;
+import org.apache.hadoop.security.authentication.client.AuthenticationException;
 import org.apache.hadoop.util.GenericOptionsParser;
+import org.apache.hadoop.util.JvmPauseMonitor;
 import org.apache.hadoop.util.StringUtils;
-
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys
-    .HDDS_SCM_WATCHER_TIMEOUT_DEFAULT;
+import org.apache.hadoop.utils.HddsVersionInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.management.ObjectName;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.Collection;
 import java.util.HashMap;
@@ -88,9 +107,9 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_DB_CACHE_SIZE_DEFAULT;
-import static org.apache.hadoop.hdds.scm.ScmConfigKeys.OZONE_SCM_DB_CACHE_SIZE_MB;
-
+import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_SCM_KERBEROS_KEYTAB_FILE_KEY;
+import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_SCM_KERBEROS_PRINCIPAL_KEY;
+import static org.apache.hadoop.hdds.scm.ScmConfigKeys.HDDS_SCM_WATCHER_TIMEOUT_DEFAULT;
 import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_ENABLED;
 import static org.apache.hadoop.util.ExitUtil.terminate;
 
@@ -137,12 +156,14 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
   private final SCMDatanodeProtocolServer datanodeProtocolServer;
   private final SCMBlockProtocolServer blockProtocolServer;
   private final SCMClientProtocolServer clientProtocolServer;
+  private final SCMSecurityProtocolServer securityProtocolServer;
 
   /*
    * State Managers of SCM.
    */
   private final NodeManager scmNodeManager;
-  private final Mapping scmContainerManager;
+  private final PipelineManager pipelineManager;
+  private final ContainerManager containerManager;
   private final BlockManager scmBlockManager;
   private final SCMStorage scmStorage;
 
@@ -164,63 +185,96 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
    * Key = DatanodeUuid, value = ContainerStat.
    */
   private Cache<String, ContainerStat> containerReportCache;
+
   private final ReplicationManager replicationManager;
+
   private final LeaseManager<Long> commandWatcherLeaseManager;
 
+  private final ReplicationActivityStatus replicationStatus;
+  private final SCMChillModeManager scmChillModeManager;
+  private final CertificateServer certificateServer;
+
+  private JvmPauseMonitor jvmPauseMonitor;
+  private final OzoneConfiguration configuration;
+
   /**
-   * Creates a new StorageContainerManager. Configuration will be updated
-   * with information on the
-   * actual listening addresses used for RPC servers.
+   * Creates a new StorageContainerManager. Configuration will be
+   * updated with information on the actual listening addresses used
+   * for RPC servers.
    *
    * @param conf configuration
    */
-  private StorageContainerManager(OzoneConfiguration conf) throws IOException {
+  private StorageContainerManager(OzoneConfiguration conf)
+      throws IOException, AuthenticationException {
+    super(HddsVersionInfo.HDDS_VERSION_INFO);
 
-    final int cacheSize = conf.getInt(OZONE_SCM_DB_CACHE_SIZE_MB,
-        OZONE_SCM_DB_CACHE_SIZE_DEFAULT);
-
+    configuration = conf;
     StorageContainerManager.initMetrics();
     initContainerReportCache(conf);
-
     scmStorage = new SCMStorage(conf);
     if (scmStorage.getState() != StorageState.INITIALIZED) {
       throw new SCMException("SCM not initialized.", ResultCodes
           .SCM_NOT_INITIALIZED);
     }
 
+    // Authenticate SCM if security is enabled
+    if (OzoneSecurityUtil.isSecurityEnabled(conf)) {
+      loginAsSCMUser(conf);
+      certificateServer = initializeCertificateServer(
+          getScmStorage().getClusterID(), getScmStorage().getScmId());
+      // TODO: Support Intermediary CAs in future.
+      certificateServer.init(new SecurityConfig(conf),
+          CertificateServer.CAType.SELF_SIGNED_CA);
+      securityProtocolServer = new SCMSecurityProtocolServer(conf,
+          certificateServer);
+    } else {
+      // if no Security, we do not create a Certificate Server at all.
+      // This allows user to boot SCM without security temporarily
+      // and then come back and enable it without any impact.
+      certificateServer = null;
+      securityProtocolServer = null;
+    }
+
     eventQueue = new EventQueue();
 
     scmNodeManager = new SCMNodeManager(
         conf, scmStorage.getClusterID(), this, eventQueue);
-    scmContainerManager = new ContainerMapping(
-        conf, getScmNodeManager(), cacheSize, eventQueue);
-    scmBlockManager = new BlockManagerImpl(
-        conf, getScmNodeManager(), scmContainerManager, eventQueue);
+    pipelineManager = new SCMPipelineManager(conf, scmNodeManager, eventQueue);
+    containerManager = new SCMContainerManager(
+        conf, scmNodeManager, pipelineManager, eventQueue);
+    scmBlockManager = new BlockManagerImpl(conf, scmNodeManager,
+        pipelineManager, containerManager, eventQueue);
 
-    Node2ContainerMap node2ContainerMap = new Node2ContainerMap();
+    replicationStatus = new ReplicationActivityStatus();
 
     CloseContainerEventHandler closeContainerHandler =
-        new CloseContainerEventHandler(scmContainerManager);
+        new CloseContainerEventHandler(pipelineManager, containerManager);
     NodeReportHandler nodeReportHandler =
         new NodeReportHandler(scmNodeManager);
-    ContainerReportHandler containerReportHandler =
-        new ContainerReportHandler(scmContainerManager, node2ContainerMap);
+    PipelineReportHandler pipelineReportHandler =
+        new PipelineReportHandler(pipelineManager, conf);
     CommandStatusReportHandler cmdStatusReportHandler =
         new CommandStatusReportHandler();
-    NewNodeHandler newNodeHandler = new NewNodeHandler(node2ContainerMap);
-    StaleNodeHandler staleNodeHandler = new StaleNodeHandler(node2ContainerMap);
-    DeadNodeHandler deadNodeHandler = new DeadNodeHandler(node2ContainerMap);
-    ContainerActionsHandler actionsHandler = new ContainerActionsHandler();
 
-    eventQueue.addHandler(SCMEvents.DATANODE_COMMAND, scmNodeManager);
-    eventQueue.addHandler(SCMEvents.NODE_REPORT, nodeReportHandler);
-    eventQueue.addHandler(SCMEvents.CONTAINER_REPORT, containerReportHandler);
-    eventQueue.addHandler(SCMEvents.CONTAINER_ACTIONS, actionsHandler);
-    eventQueue.addHandler(SCMEvents.CLOSE_CONTAINER, closeContainerHandler);
-    eventQueue.addHandler(SCMEvents.NEW_NODE, newNodeHandler);
-    eventQueue.addHandler(SCMEvents.STALE_NODE, staleNodeHandler);
-    eventQueue.addHandler(SCMEvents.DEAD_NODE, deadNodeHandler);
-    eventQueue.addHandler(SCMEvents.CMD_STATUS_REPORT, cmdStatusReportHandler);
+    NewNodeHandler newNodeHandler = new NewNodeHandler();
+    StaleNodeHandler staleNodeHandler =
+        new StaleNodeHandler(scmNodeManager, pipelineManager, conf);
+    DeadNodeHandler deadNodeHandler = new DeadNodeHandler(scmNodeManager,
+        containerManager);
+    ContainerActionsHandler actionsHandler = new ContainerActionsHandler();
+    PendingDeleteHandler pendingDeleteHandler =
+        new PendingDeleteHandler(scmBlockManager.getSCMBlockDeletingService());
+
+    ContainerReportHandler containerReportHandler =
+        new ContainerReportHandler(scmNodeManager, pipelineManager,
+            containerManager, replicationStatus);
+
+    IncrementalContainerReportHandler incrementalContainerReportHandler =
+        new IncrementalContainerReportHandler(
+            pipelineManager, containerManager);
+
+    PipelineActionHandler pipelineActionHandler =
+        new PipelineActionHandler(pipelineManager, conf);
 
     long watcherTimeout =
         conf.getTimeDuration(ScmConfigKeys.HDDS_SCM_WATCHER_TIMEOUT,
@@ -229,13 +283,19 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     commandWatcherLeaseManager = new LeaseManager<>("CommandWatcher",
         watcherTimeout);
 
+    RetriableDatanodeEventWatcher retriableDatanodeEventWatcher =
+        new RetriableDatanodeEventWatcher<>(
+            SCMEvents.RETRIABLE_DATANODE_COMMAND,
+            SCMEvents.DELETE_BLOCK_STATUS,
+            commandWatcherLeaseManager);
+    retriableDatanodeEventWatcher.start(eventQueue);
+
     //TODO: support configurable containerPlacement policy
     ContainerPlacementPolicy containerPlacementPolicy =
         new SCMContainerPlacementCapacity(scmNodeManager, conf);
 
     replicationManager = new ReplicationManager(containerPlacementPolicy,
-        scmContainerManager.getStateManager(), eventQueue,
-        commandWatcherLeaseManager);
+        containerManager, eventQueue, commandWatcherLeaseManager);
 
     scmAdminUsernames = conf.getTrimmedStringCollection(OzoneConfigKeys
         .OZONE_ADMINISTRATORS);
@@ -249,18 +309,96 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     blockProtocolServer = new SCMBlockProtocolServer(conf, this);
     clientProtocolServer = new SCMClientProtocolServer(conf, this);
     httpServer = new StorageContainerManagerHttpServer(conf);
+
+    eventQueue.addHandler(SCMEvents.DATANODE_COMMAND, scmNodeManager);
+    eventQueue.addHandler(SCMEvents.RETRIABLE_DATANODE_COMMAND, scmNodeManager);
+    eventQueue.addHandler(SCMEvents.NODE_REPORT, nodeReportHandler);
+    eventQueue.addHandler(SCMEvents.CONTAINER_REPORT, containerReportHandler);
+    eventQueue.addHandler(SCMEvents.INCREMENTAL_CONTAINER_REPORT,
+        incrementalContainerReportHandler);
+    eventQueue.addHandler(SCMEvents.CONTAINER_ACTIONS, actionsHandler);
+    eventQueue.addHandler(SCMEvents.CLOSE_CONTAINER, closeContainerHandler);
+    eventQueue.addHandler(SCMEvents.NEW_NODE, newNodeHandler);
+    eventQueue.addHandler(SCMEvents.STALE_NODE, staleNodeHandler);
+    eventQueue.addHandler(SCMEvents.DEAD_NODE, deadNodeHandler);
+    eventQueue.addHandler(SCMEvents.CMD_STATUS_REPORT, cmdStatusReportHandler);
+    eventQueue.addHandler(SCMEvents.START_REPLICATION,
+        replicationStatus.getReplicationStatusListener());
+    eventQueue
+        .addHandler(SCMEvents.PENDING_DELETE_STATUS, pendingDeleteHandler);
+    eventQueue.addHandler(SCMEvents.DELETE_BLOCK_STATUS,
+        (DeletedBlockLogImpl) scmBlockManager.getDeletedBlockLog());
+    eventQueue.addHandler(SCMEvents.PIPELINE_ACTIONS, pipelineActionHandler);
+    eventQueue.addHandler(SCMEvents.CHILL_MODE_STATUS, clientProtocolServer);
+    eventQueue.addHandler(SCMEvents.PIPELINE_REPORT, pipelineReportHandler);
+
+    eventQueue.addHandler(SCMEvents.CHILL_MODE_STATUS,
+        replicationStatus.getChillModeStatusListener());
+    eventQueue.addHandler(SCMEvents.CHILL_MODE_STATUS,
+        (BlockManagerImpl) scmBlockManager);
+    scmChillModeManager = new SCMChillModeManager(conf,
+        containerManager.getContainers(), pipelineManager, eventQueue);
+
+    eventQueue.addHandler(SCMEvents.NODE_REGISTRATION_CONT_REPORT,
+        scmChillModeManager);
     registerMXBean();
+
+  }
+
+  /**
+   * Login as the configured user for SCM.
+   *
+   * @param conf
+   */
+  private void loginAsSCMUser(Configuration conf)
+      throws IOException, AuthenticationException {
+    LOG.debug("Ozone security is enabled. Attempting login for SCM user. "
+            + "Principal: {}, keytab: {}",
+        conf.get(HDDS_SCM_KERBEROS_PRINCIPAL_KEY),
+        conf.get(HDDS_SCM_KERBEROS_KEYTAB_FILE_KEY));
+
+    if (SecurityUtil.getAuthenticationMethod(conf).equals(
+        AuthenticationMethod.KERBEROS)) {
+      UserGroupInformation.setConfiguration(conf);
+      InetSocketAddress socAddr = HddsServerUtil
+          .getScmBlockClientBindAddress(conf);
+      SecurityUtil.login(conf, HDDS_SCM_KERBEROS_KEYTAB_FILE_KEY,
+          HDDS_SCM_KERBEROS_PRINCIPAL_KEY, socAddr.getHostName());
+    } else {
+      throw new AuthenticationException(SecurityUtil.getAuthenticationMethod(
+          conf) + " authentication method not support. "
+          + "SCM user login failed.");
+    }
+    LOG.info("SCM login successful.");
+  }
+
+
+  /**
+   * This function creates/initializes a certificate server as needed.
+   * This function is idempotent, so calling this again and again after the
+   * server is initialized is not a problem.
+   *
+   * @param clusterID - Cluster ID
+   * @param scmID     - SCM ID
+   */
+  private CertificateServer initializeCertificateServer(String clusterID,
+      String scmID) throws IOException {
+    // TODO: Support Certificate Server loading via Class Name loader.
+    // So it is easy to use different Certificate Servers if needed.
+    String subject = "scm@" + InetAddress.getLocalHost().getHostName();
+    return new DefaultCAServer(subject, clusterID, scmID);
+
   }
 
   /**
    * Builds a message for logging startup information about an RPC server.
    *
    * @param description RPC server description
-   * @param addr RPC server listening address
+   * @param addr        RPC server listening address
    * @return server startup message
    */
   public static String buildRpcServerStartMessage(String description,
-      InetSocketAddress addr) {
+                                                  InetSocketAddress addr) {
     return addr != null
         ? String.format("%s is listening at %s", description, addr.toString())
         : String.format("%s not started", description);
@@ -317,9 +455,8 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
         hParser.printGenericCommandUsage(System.err);
         System.exit(1);
       }
-      StringUtils.startupShutdownMessage(StorageContainerManager.class, argv,
-          LOG);
-      StorageContainerManager scm = createSCM(hParser.getRemainingArgs(), conf);
+      StorageContainerManager scm = createSCM(
+          hParser.getRemainingArgs(), conf, true);
       if (scm != null) {
         scm.start();
         scm.join();
@@ -334,9 +471,40 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     out.println(USAGE + "\n");
   }
 
-  public static StorageContainerManager createSCM(String[] argv,
-      OzoneConfiguration conf)
-      throws IOException {
+  /**
+   * Create an SCM instance based on the supplied command-line arguments.
+   * <p>
+   * This method is intended for unit tests only. It suppresses the
+   * startup/shutdown message and skips registering Unix signal
+   * handlers.
+   *
+   * @param args command line arguments.
+   * @param conf HDDS configuration
+   * @return SCM instance
+   * @throws IOException, AuthenticationException
+   */
+  @VisibleForTesting
+  public static StorageContainerManager createSCM(
+      String[] args, OzoneConfiguration conf)
+      throws IOException, AuthenticationException {
+    return createSCM(args, conf, false);
+  }
+
+  /**
+   * Create an SCM instance based on the supplied command-line arguments.
+   *
+   * @param args        command-line arguments.
+   * @param conf        HDDS configuration
+   * @param printBanner if true, then log a verbose startup message.
+   * @return SCM instance
+   * @throws IOException, AuthenticationException
+   */
+  private static StorageContainerManager createSCM(
+      String[] args,
+      OzoneConfiguration conf,
+      boolean printBanner)
+      throws IOException, AuthenticationException {
+    String[] argv = (args == null) ? new String[0] : args;
     if (!HddsUtils.isHddsEnabled(conf)) {
       System.err.println(
           "SCM cannot be started in secure mode or when " + OZONE_ENABLED + "" +
@@ -351,9 +519,17 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     }
     switch (startOpt) {
     case INIT:
+      if (printBanner) {
+        StringUtils.startupShutdownMessage(StorageContainerManager.class, argv,
+            LOG);
+      }
       terminate(scmInit(conf) ? 0 : 1);
       return null;
     case GENCLUSTERID:
+      if (printBanner) {
+        StringUtils.startupShutdownMessage(StorageContainerManager.class, argv,
+            LOG);
+      }
       System.out.println("Generating new cluster id:");
       System.out.println(StorageInfo.newClusterID());
       terminate(0);
@@ -363,6 +539,10 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
       terminate(0);
       return null;
     default:
+      if (printBanner) {
+        StringUtils.startupShutdownMessage(StorageContainerManager.class, argv,
+            LOG);
+      }
       return new StorageContainerManager(conf);
     }
   }
@@ -408,7 +588,7 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
 
   private static StartupOption parseArguments(String[] args) {
     int argsLen = (args == null) ? 0 : args.length;
-    StartupOption startOpt = StartupOption.HELP;
+    StartupOption startOpt = null;
     if (argsLen == 0) {
       startOpt = StartupOption.REGULAR;
     }
@@ -478,6 +658,10 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     return clientProtocolServer;
   }
 
+  public SCMSecurityProtocolServer getSecurityProtocolServer() {
+    return securityProtocolServer;
+  }
+
   /**
    * Initialize container reports cache that sent from datanodes.
    *
@@ -509,12 +693,11 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
   }
 
   private void registerMXBean() {
-    Map<String, String> jmxProperties = new HashMap<>();
+    final Map<String, String> jmxProperties = new HashMap<>();
     jmxProperties.put("component", "ServerRuntime");
-    this.scmInfoBeanName =
-        MBeans.register(
-            "StorageContainerManager", "StorageContainerManagerInfo",
-            jmxProperties, this);
+    this.scmInfoBeanName = HddsUtils.registerWithJmxProperties(
+        "StorageContainerManager", "StorageContainerManagerInfo",
+        jmxProperties, this);
   }
 
   private void unregisterMXBean() {
@@ -527,7 +710,7 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
   @VisibleForTesting
   public ContainerInfo getContainerInfo(long containerID) throws
       IOException {
-    return scmContainerManager.getContainer(containerID);
+    return containerManager.getContainer(ContainerID.valueof(containerID));
   }
 
   /**
@@ -570,6 +753,8 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
             "StorageContainerLocationProtocol RPC server",
             getClientRpcAddress()));
     DefaultMetricsSystem.initialize("StorageContainerManager");
+
+    commandWatcherLeaseManager.start();
     getClientProtocolServer().start();
 
     LOG.info(buildRpcServerStartMessage("ScmBlockLocationProtocol RPC " +
@@ -579,10 +764,20 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     LOG.info(buildRpcServerStartMessage("ScmDatanodeProtocl RPC " +
         "server", getDatanodeProtocolServer().getDatanodeRpcAddress()));
     getDatanodeProtocolServer().start();
+    if (getSecurityProtocolServer() != null) {
+      getSecurityProtocolServer().start();
+    }
 
     httpServer.start();
     scmBlockManager.start();
+    replicationStatus.start();
     replicationManager.start();
+
+    // Start jvm monitor
+    jvmPauseMonitor = new JvmPauseMonitor();
+    jvmPauseMonitor.init(configuration);
+    jvmPauseMonitor.start();
+
     setStartTime();
   }
 
@@ -590,6 +785,14 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
    * Stop service.
    */
   public void stop() {
+
+    try {
+      LOG.info("Stopping Replication Activity Status tracker.");
+      replicationStatus.close();
+    } catch (Exception ex) {
+      LOG.error("Replication Activity Status tracker stop failed.", ex);
+    }
+
 
     try {
       LOG.info("Stopping Replication Manager Service.");
@@ -634,6 +837,10 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
       LOG.error("Storage Container Manager HTTP server stop failed.", ex);
     }
 
+    if (getSecurityProtocolServer() != null) {
+      getSecurityProtocolServer().stop();
+    }
+
     try {
       LOG.info("Stopping Block Manager Service.");
       scmBlockManager.stop();
@@ -651,7 +858,19 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
     }
 
     unregisterMXBean();
-    IOUtils.cleanupWithLogger(LOG, scmContainerManager);
+    // Event queue must be stopped before the DB store is closed at the end.
+    try {
+      LOG.info("Stopping SCM Event Queue.");
+      eventQueue.close();
+    } catch (Exception ex) {
+      LOG.error("SCM Event Queue stop failed", ex);
+    }
+
+    if (jvmPauseMonitor != null) {
+      jvmPauseMonitor.stop();
+    }
+    IOUtils.cleanupWithLogger(LOG, containerManager);
+    IOUtils.cleanupWithLogger(LOG, pipelineManager);
   }
 
   /**
@@ -662,6 +881,9 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
       getBlockProtocolServer().join();
       getClientProtocolServer().join();
       getDatanodeProtocolServer().join();
+      if (getSecurityProtocolServer() != null) {
+        getSecurityProtocolServer().join();
+      }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
       LOG.info("Interrupted during StorageContainerManager join.");
@@ -682,8 +904,8 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
    * Returns SCM container manager.
    */
   @VisibleForTesting
-  public Mapping getScmContainerManager() {
-    return scmContainerManager;
+  public ContainerManager getContainerManager() {
+    return containerManager;
   }
 
   /**
@@ -694,6 +916,16 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
   @VisibleForTesting
   public NodeManager getScmNodeManager() {
     return scmNodeManager;
+  }
+
+  /**
+   * Returns pipeline manager.
+   *
+   * @return - Pipeline Manager
+   */
+  @VisibleForTesting
+  public PipelineManager getPipelineManager() {
+    return pipelineManager;
   }
 
   @VisibleForTesting
@@ -762,13 +994,62 @@ public final class StorageContainerManager extends ServiceRuntimeInfoImpl
   }
 
   /**
+   * Returns live chill mode container threshold.
+   *
+   * @return String
+   */
+  @Override
+  public double getChillModeCurrentContainerThreshold() {
+    return getCurrentContainerThreshold();
+  }
+
+  /**
+   * Returns chill mode status.
+   * @return boolean
+   */
+  @Override
+  public boolean isInChillMode() {
+    return scmChillModeManager.getInChillMode();
+  }
+
+  /**
+   * Returns EventPublisher.
+   */
+  public EventPublisher getEventQueue() {
+    return eventQueue;
+  }
+
+  /**
+   * Force SCM out of chill mode.
+   */
+  public boolean exitChillMode() {
+    scmChillModeManager.exitChillMode(eventQueue);
+    return true;
+  }
+
+  @VisibleForTesting
+  public double getCurrentContainerThreshold() {
+    return scmChillModeManager.getCurrentContainerThreshold();
+  }
+
+  @Override
+  public Map<String, Integer> getContainerStateCount() {
+    Map<String, Integer> nodeStateCount = new HashMap<>();
+    for (HddsProtos.LifeCycleState state : HddsProtos.LifeCycleState.values()) {
+      nodeStateCount.put(state.toString(), containerManager.getContainers(
+          state).size());
+    }
+    return nodeStateCount;
+  }
+
+  /**
    * Startup options.
    */
   public enum StartupOption {
-    INIT("-init"),
-    CLUSTERID("-clusterid"),
-    GENCLUSTERID("-genclusterid"),
-    REGULAR("-regular"),
+    INIT("--init"),
+    CLUSTERID("--clusterid"),
+    GENCLUSTERID("--genclusterid"),
+    REGULAR("--regular"),
     HELP("-help");
 
     private final String name;

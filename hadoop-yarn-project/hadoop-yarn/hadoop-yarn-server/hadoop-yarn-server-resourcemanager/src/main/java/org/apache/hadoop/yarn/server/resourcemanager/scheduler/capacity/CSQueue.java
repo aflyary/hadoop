@@ -86,6 +86,10 @@ public interface CSQueue extends SchedulerQueue<CSQueue> {
 
   public PrivilegedEntity getPrivilegedEntity();
 
+  Resource getMaximumAllocation();
+
+  Resource getMinimumAllocation();
+
   /**
    * Get the configured <em>capacity</em> of the queue.
    * @return configured queue capacity
@@ -430,4 +434,10 @@ public interface CSQueue extends SchedulerQueue<CSQueue> {
    * @return effective max queue capacity
    */
   Resource getEffectiveMaxCapacityDown(String label, Resource factor);
+
+  /**
+   * Get Multi Node scheduling policy name.
+   * @return policy name
+   */
+  String getMultiNodeSortingPolicyName();
 }

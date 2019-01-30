@@ -41,19 +41,18 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.UUID;
 
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
 
+/**
+ * Unit test for command status report handler.
+ */
 public class TestCommandStatusReportHandler implements EventPublisher {
 
-  private static Logger LOG = LoggerFactory
+  private static final Logger LOG = LoggerFactory
       .getLogger(TestCommandStatusReportHandler.class);
   private CommandStatusReportHandler cmdStatusReportHandler;
-  private String storagePath = GenericTestUtils.getRandomizedTempPath()
-      .concat("/" + UUID.randomUUID().toString());
-  ;
 
   @Before
   public void setup() {
@@ -68,24 +67,16 @@ public class TestCommandStatusReportHandler implements EventPublisher {
     CommandStatusReportFromDatanode report = this.getStatusReport(Collections
         .emptyList());
     cmdStatusReportHandler.onMessage(report, this);
-    assertFalse(logCapturer.getOutput().contains("DeleteBlockCommandStatus"));
-    assertFalse(logCapturer.getOutput().contains
-        ("CloseContainerCommandStatus"));
-    assertFalse(logCapturer.getOutput().contains
-        ("ReplicateCommandStatus"));
-
+    assertFalse(logCapturer.getOutput().contains("Delete_Block_Status"));
+    assertFalse(logCapturer.getOutput().contains("Replicate_Command_Status"));
 
     report = this.getStatusReport(this.getCommandStatusList());
     cmdStatusReportHandler.onMessage(report, this);
     assertTrue(logCapturer.getOutput().contains("firing event of type " +
-        "DeleteBlockCommandStatus"));
+        "Delete_Block_Status"));
     assertTrue(logCapturer.getOutput().contains("firing event of type " +
-        "CloseContainerCommandStatus"));
-    assertTrue(logCapturer.getOutput().contains("firing event of type " +
-        "ReplicateCommandStatus"));
+        "Replicate_Command_Status"));
 
-    assertTrue(logCapturer.getOutput().contains("type: " +
-        "closeContainerCommand"));
     assertTrue(logCapturer.getOutput().contains("type: " +
         "deleteBlocksCommand"));
     assertTrue(logCapturer.getOutput().contains("type: " +
@@ -93,18 +84,18 @@ public class TestCommandStatusReportHandler implements EventPublisher {
 
   }
 
-  private CommandStatusReportFromDatanode getStatusReport(List<CommandStatus>
-      reports) {
-    CommandStatusReportsProto report = TestUtils.createCommandStatusReport
-        (reports);
+  private CommandStatusReportFromDatanode getStatusReport(
+      List<CommandStatus> reports) {
+    CommandStatusReportsProto report = TestUtils.createCommandStatusReport(
+        reports);
     DatanodeDetails dn = TestUtils.randomDatanodeDetails();
-    return new SCMDatanodeHeartbeatDispatcher.CommandStatusReportFromDatanode
-        (dn, report);
+    return new SCMDatanodeHeartbeatDispatcher.CommandStatusReportFromDatanode(
+        dn, report);
   }
 
   @Override
-  public <PAYLOAD, EVENT_TYPE extends Event<PAYLOAD>> void fireEvent
-      (EVENT_TYPE event, PAYLOAD payload) {
+  public <PAYLOAD, EVENT_TYPE extends Event<PAYLOAD>> void
+      fireEvent(EVENT_TYPE event, PAYLOAD payload) {
     LOG.info("firing event of type {}, payload {}", event.getName(), payload
         .toString());
   }
@@ -119,11 +110,6 @@ public class TestCommandStatusReportHandler implements EventPublisher {
     builder.setCmdId(HddsIdFactory.getLongId())
         .setStatus(CommandStatus.Status.EXECUTED)
         .setType(Type.deleteBlocksCommand);
-    reports.add(builder.build());
-
-    builder.setCmdId(HddsIdFactory.getLongId())
-        .setStatus(CommandStatus.Status.EXECUTED)
-        .setType(Type.closeContainerCommand);
     reports.add(builder.build());
 
     builder.setMsg("Not enough space")
