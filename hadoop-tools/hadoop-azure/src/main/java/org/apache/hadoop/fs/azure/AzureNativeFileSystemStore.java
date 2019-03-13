@@ -70,7 +70,7 @@ import com.microsoft.azure.storage.RetryNoRetry;
 import com.microsoft.azure.storage.StorageCredentials;
 import com.microsoft.azure.storage.StorageCredentialsAccountAndKey;
 import com.microsoft.azure.storage.StorageCredentialsSharedAccessSignature;
-import com.microsoft.azure.storage.StorageErrorCode;
+import com.microsoft.azure.storage.StorageErrorCodeStrings;
 import com.microsoft.azure.storage.StorageException;
 import com.microsoft.azure.storage.Constants;
 import com.microsoft.azure.storage.StorageEvent;
@@ -910,15 +910,16 @@ public class AzureNativeFileSystemStore implements NativeFileSystemStore {
       String containerName, URI sessionUri)
           throws AzureException, StorageException, URISyntaxException {
 
+    LOG.debug("Connecting to Azure storage in Secure Mode");
     // Assertion: storageInteractionLayer instance has to be a SecureStorageInterfaceImpl
     if (!(this.storageInteractionLayer instanceof SecureStorageInterfaceImpl)) {
-      throw new AssertionError("connectToAzureStorageInSASKeyMode() should be called only"
+      throw new AssertionError("connectToAzureStorageInSecureMode() should be called only"
         + " for SecureStorageInterfaceImpl instances");
     }
 
     ((SecureStorageInterfaceImpl) this.storageInteractionLayer).
       setStorageAccountName(accountName);
-
+    connectingUsingSAS = true;
     container = storageInteractionLayer.getContainerReference(containerName);
     rootDirectory = container.getDirectoryReference("");
 
@@ -1336,7 +1337,7 @@ public class AzureNativeFileSystemStore implements NativeFileSystemStore {
         container.downloadAttributes(getInstrumentedContext());
         currentKnownContainerState = ContainerState.Unknown;
       } catch (StorageException ex) {
-        if (StorageErrorCode.RESOURCE_NOT_FOUND.toString()
+        if (StorageErrorCodeStrings.CONTAINER_NOT_FOUND.toString()
             .equals(ex.getErrorCode())) {
           currentKnownContainerState = ContainerState.DoesntExist;
         } else {
@@ -1761,7 +1762,7 @@ public class AzureNativeFileSystemStore implements NativeFileSystemStore {
       throw new AzureException(e);
     } catch (IOException e) {
       Throwable t = e.getCause();
-      if (t != null && t instanceof StorageException) {
+      if (t instanceof StorageException) {
         StorageException se = (StorageException) t;
         // If we got this exception, the blob should have already been created
         if (!"LeaseIdMissing".equals(se.getErrorCode())) {
@@ -2637,7 +2638,7 @@ public class AzureNativeFileSystemStore implements NativeFileSystemStore {
       return delete(key, null);
     } catch (IOException e) {
       Throwable t = e.getCause();
-      if (t != null && t instanceof StorageException) {
+      if (t instanceof StorageException) {
         StorageException se = (StorageException) t;
         if ("LeaseIdMissing".equals(se.getErrorCode())){
           SelfRenewingLease lease = null;

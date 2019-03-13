@@ -31,8 +31,8 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.ConcurrentHashMap;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.net.Node;
@@ -66,7 +66,8 @@ import com.google.common.annotations.VisibleForTesting;
 public class NodesListManager extends CompositeService implements
     EventHandler<NodesListManagerEvent> {
 
-  private static final Log LOG = LogFactory.getLog(NodesListManager.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(NodesListManager.class);
 
   private HostsFileReader hostsReader;
   private Configuration conf;
@@ -113,7 +114,7 @@ public class NodesListManager extends CompositeService implements
           YarnConfiguration.DEFAULT_RM_NODES_EXCLUDE_FILE_PATH);
       this.hostsReader =
           createHostsFileReader(this.includesFile, this.excludesFile);
-      setDecomissionedNMs();
+      setDecommissionedNMs();
       printConfiguredHosts();
     } catch (YarnException ex) {
       disableHostsFileReader(ex);
@@ -245,7 +246,7 @@ public class NodesListManager extends CompositeService implements
     handleExcludeNodeList(graceful, timeout);
   }
 
-  private void setDecomissionedNMs() {
+  private void setDecommissionedNMs() {
     Set<String> excludeList = hostsReader.getExcludedHosts();
     for (final String host : excludeList) {
       NodeId nodeId = createUnknownNodeId(host);
@@ -526,7 +527,7 @@ public class NodesListManager extends CompositeService implements
           conf.get(YarnConfiguration.DEFAULT_RM_NODES_EXCLUDE_FILE_PATH);
       this.hostsReader =
           createHostsFileReader(this.includesFile, this.excludesFile);
-      setDecomissionedNMs();
+      setDecommissionedNMs();
     } catch (IOException ioe2) {
       // Should *never* happen
       this.hostsReader = null;

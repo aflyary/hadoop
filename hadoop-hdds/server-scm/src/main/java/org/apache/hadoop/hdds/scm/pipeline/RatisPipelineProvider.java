@@ -28,6 +28,7 @@ import org.apache.hadoop.hdds.scm.container.placement.algorithms.ContainerPlacem
 import org.apache.hadoop.hdds.scm.container.placement.algorithms.SCMContainerPlacementRandom;
 import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline.PipelineState;
+import org.apache.hadoop.utils.Scheduler;
 
 import java.io.IOException;
 import java.lang.reflect.Constructor;
@@ -37,6 +38,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+
 /**
  * Implements Api for creating ratis pipelines.
  */
@@ -45,12 +48,20 @@ public class RatisPipelineProvider implements PipelineProvider {
   private final NodeManager nodeManager;
   private final PipelineStateManager stateManager;
   private final Configuration conf;
+  private static Scheduler scheduler;
 
+  //TODO static Scheduler should be removed!!!! HDDS-1128
+  @SuppressFBWarnings("ST_WRITE_TO_STATIC_FROM_INSTANCE_METHOD")
   RatisPipelineProvider(NodeManager nodeManager,
       PipelineStateManager stateManager, Configuration conf) {
     this.nodeManager = nodeManager;
     this.stateManager = stateManager;
     this.conf = conf;
+    scheduler = new Scheduler("RatisPipelineUtilsThread", false, 1);
+  }
+
+  static Scheduler getScheduler() {
+    return scheduler;
   }
 
   /**
@@ -92,7 +103,7 @@ public class RatisPipelineProvider implements PipelineProvider {
   public Pipeline create(ReplicationFactor factor) throws IOException {
     // Get set of datanodes already used for ratis pipeline
     Set<DatanodeDetails> dnsUsed = new HashSet<>();
-    stateManager.getPipelines(ReplicationType.RATIS)
+    stateManager.getPipelines(ReplicationType.RATIS, factor)
         .forEach(p -> dnsUsed.addAll(p.getNodes()));
 
     // Get list of healthy nodes
@@ -132,7 +143,12 @@ public class RatisPipelineProvider implements PipelineProvider {
         .build();
   }
 
-  private void initializePipeline(Pipeline pipeline) throws IOException {
+  protected void initializePipeline(Pipeline pipeline) throws IOException {
     RatisPipelineUtils.createPipeline(pipeline, conf);
+  }
+
+  @Override
+  public void close() {
+    scheduler.close();
   }
 }

@@ -33,8 +33,8 @@ import java.util.concurrent.locks.ReentrantReadWriteLock.WriteLock;
 
 import org.apache.commons.collections.CollectionUtils;
 import com.google.common.collect.ImmutableMap;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.ipc.Server;
@@ -98,7 +98,8 @@ import com.google.common.annotations.VisibleForTesting;
 public class ResourceTrackerService extends AbstractService implements
     ResourceTracker {
 
-  private static final Log LOG = LogFactory.getLog(ResourceTrackerService.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(ResourceTrackerService.class);
 
   private static final RecordFactory recordFactory = 
     RecordFactoryProvider.getRecordFactory(null);
@@ -128,6 +129,7 @@ public class ResourceTrackerService extends AbstractService implements
 
   private final AtomicLong timelineCollectorVersion = new AtomicLong(0);
   private boolean checkIpHostnameInRegistration;
+  private boolean timelineServiceV2Enabled;
 
   public ResourceTrackerService(RMContext rmContext,
       NodesListManager nodesListManager,
@@ -177,6 +179,8 @@ public class ResourceTrackerService extends AbstractService implements
     minimumNodeManagerVersion = conf.get(
         YarnConfiguration.RM_NODEMANAGER_MINIMUM_VERSION,
         YarnConfiguration.DEFAULT_RM_NODEMANAGER_MINIMUM_VERSION);
+    timelineServiceV2Enabled =  YarnConfiguration.
+        timelineServiceV2Enabled(conf);
 
     if (YarnConfiguration.areNodeLabelsEnabled(conf)) {
       isDistributedNodeLabelsConf =
@@ -621,9 +625,7 @@ public class ResourceTrackerService extends AbstractService implements
           NodeAction.SHUTDOWN, message);
     }
 
-    boolean timelineV2Enabled =
-        YarnConfiguration.timelineServiceV2Enabled(getConfig());
-    if (timelineV2Enabled) {
+    if (timelineServiceV2Enabled) {
       // Check & update collectors info from request.
       updateAppCollectorsMap(request);
     }
@@ -639,7 +641,7 @@ public class ResourceTrackerService extends AbstractService implements
 
     populateTokenSequenceNo(request, nodeHeartBeatResponse);
 
-    if (timelineV2Enabled) {
+    if (timelineServiceV2Enabled) {
       // Return collectors' map that NM needs to know
       setAppCollectorsMapToResponse(rmNode.getRunningApps(),
           nodeHeartBeatResponse);
@@ -880,7 +882,7 @@ public class ResourceTrackerService extends AbstractService implements
           .append("} reported from NM with ID ").append(nodeId)
           .append(" was rejected from RM with exception message as : ")
           .append(ex.getMessage());
-      LOG.error(errorMessage, ex);
+      LOG.error(errorMessage.toString(), ex);
       throw new IOException(errorMessage.toString(), ex);
     }
   }

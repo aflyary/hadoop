@@ -18,19 +18,25 @@
 
 package org.apache.hadoop.ozone.client.rpc;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.StorageUnit;
+import org.apache.hadoop.crypto.CryptoInputStream;
+import org.apache.hadoop.crypto.CryptoOutputStream;
+import org.apache.hadoop.crypto.key.KeyProvider;
+import org.apache.hadoop.fs.FileEncryptionInfo;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.StorageType;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
     .ChecksumType;
 import org.apache.hadoop.hdds.scm.client.HddsClientUtils;
+import org.apache.hadoop.hdds.scm.protocol.StorageContainerLocationProtocol;
+import org.apache.hadoop.hdds.tracing.TracingUtil;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ipc.Client;
 import org.apache.hadoop.ipc.ProtobufRpcEngine;
 import org.apache.hadoop.ipc.RPC;
-import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.client.*;
@@ -44,7 +50,8 @@ import org.apache.hadoop.ozone.client.io.LengthInputStream;
 import org.apache.hadoop.ozone.client.io.OzoneInputStream;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
 import org.apache.hadoop.ozone.client.protocol.ClientProtocol;
-import org.apache.hadoop.ozone.common.Checksum;
+import org.apache.hadoop.ozone.om.ha.OMFailoverProxyProvider;
+import org.apache.hadoop.ozone.om.helpers.BucketEncryptionKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmBucketArgs;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
@@ -52,12 +59,15 @@ import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadCompleteInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadList;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadListParts;
+import org.apache.hadoop.ozone.om.helpers.OmPartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.ozone.om.helpers.OpenKeySession;
 import org.apache.hadoop.ozone.om.helpers.S3SecretValue;
 import org.apache.hadoop.ozone.om.helpers.ServiceInfo;
-import org.apache.hadoop.ozone.om.protocolPB.OzoneManagerProtocolClientSideTranslatorPB;
-import org.apache.hadoop.ozone.om.protocolPB.OzoneManagerProtocolPB;
+import org.apache.hadoop.ozone.om.protocol.OzoneManagerProtocol;
+import org.apache.hadoop.ozone.om.protocolPB
+    .OzoneManagerProtocolClientSideTranslatorPB;
 import org.apache.hadoop.net.NetUtils;
 import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.om.OMConfigKeys;
@@ -97,13 +107,14 @@ public class RpcClient implements ClientProtocol {
       LoggerFactory.getLogger(RpcClient.class);
 
   private final OzoneConfiguration conf;
-  private final StorageContainerLocationProtocolClientSideTranslatorPB
+  private final StorageContainerLocationProtocol
       storageContainerLocationClient;
-  private final OzoneManagerProtocolClientSideTranslatorPB
-      ozoneManagerClient;
+  private final OzoneManagerProtocol ozoneManagerClient;
   private final XceiverClientManager xceiverClientManager;
   private final int chunkSize;
-  private final Checksum checksum;
+  private final ChecksumType checksumType;
+  private final int bytesPerChecksum;
+  private boolean verifyChecksum;
   private final UserGroupInformation ugi;
   private final OzoneAcl.OzoneACLRights userRights;
   private final OzoneAcl.OzoneACLRights groupRights;
@@ -111,7 +122,7 @@ public class RpcClient implements ClientProtocol {
   private final long streamBufferMaxSize;
   private final long blockSize;
   private final long watchTimeout;
-  private ClientId clientId = ClientId.randomId();
+  private final ClientId clientId = ClientId.randomId();
 
    /**
     * Creates RpcClient instance with the given configuration.
@@ -126,29 +137,22 @@ public class RpcClient implements ClientProtocol {
         OMConfigKeys.OZONE_OM_USER_RIGHTS_DEFAULT);
     this.groupRights = conf.getEnum(OMConfigKeys.OZONE_OM_GROUP_RIGHTS,
         OMConfigKeys.OZONE_OM_GROUP_RIGHTS_DEFAULT);
-    long omVersion =
-        RPC.getProtocolVersion(OzoneManagerProtocolPB.class);
-    InetSocketAddress omAddress = OmUtils
-        .getOmAddressForClients(conf);
-    RPC.setProtocolEngine(conf, OzoneManagerProtocolPB.class,
-        ProtobufRpcEngine.class);
-    this.ozoneManagerClient =
-        new OzoneManagerProtocolClientSideTranslatorPB(
-            RPC.getProxy(OzoneManagerProtocolPB.class, omVersion,
-                omAddress, ugi, conf, NetUtils.getDefaultSocketFactory(conf),
-                Client.getRpcTimeout(conf)), clientId.toString());
+    this.ozoneManagerClient = new OzoneManagerProtocolClientSideTranslatorPB(
+        this.conf, clientId.toString(), ugi);
 
     long scmVersion =
         RPC.getProtocolVersion(StorageContainerLocationProtocolPB.class);
     InetSocketAddress scmAddress = getScmAddressForClient();
     RPC.setProtocolEngine(conf, StorageContainerLocationProtocolPB.class,
         ProtobufRpcEngine.class);
-    this.storageContainerLocationClient =
+
+    StorageContainerLocationProtocolClientSideTranslatorPB client =
         new StorageContainerLocationProtocolClientSideTranslatorPB(
             RPC.getProxy(StorageContainerLocationProtocolPB.class, scmVersion,
                 scmAddress, ugi, conf, NetUtils.getDefaultSocketFactory(conf),
                 Client.getRpcTimeout(conf)));
-
+    this.storageContainerLocationClient =
+        TracingUtil.createProxy(client, StorageContainerLocationProtocol.class);
     this.xceiverClientManager = new XceiverClientManager(conf);
 
     int configuredChunkSize = (int) conf
@@ -182,22 +186,25 @@ public class RpcClient implements ClientProtocol {
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM,
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_DEFAULT,
         StorageUnit.BYTES);
-    int checksumSize;
     if(configuredChecksumSize <
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE) {
       LOG.warn("The checksum size ({}) is not allowed to be less than the " +
               "minimum size ({}), resetting to the minimum size.",
           configuredChecksumSize,
           OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE);
-      checksumSize = OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE;
+      bytesPerChecksum =
+          OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE;
     } else {
-      checksumSize = configuredChecksumSize;
+      bytesPerChecksum = configuredChecksumSize;
     }
+
     String checksumTypeStr = conf.get(
         OzoneConfigKeys.OZONE_CLIENT_CHECKSUM_TYPE,
         OzoneConfigKeys.OZONE_CLIENT_CHECKSUM_TYPE_DEFAULT);
-    ChecksumType checksumType = ChecksumType.valueOf(checksumTypeStr);
-    this.checksum = new Checksum(checksumType, checksumSize);
+    checksumType = ChecksumType.valueOf(checksumTypeStr);
+    this.verifyChecksum =
+        conf.getBoolean(OzoneConfigKeys.OZONE_CLIENT_VERIFY_CHECKSUM,
+            OzoneConfigKeys.OZONE_CLIENT_VERIFY_CHECKSUM_DEFAULT);
   }
 
   private InetSocketAddress getScmAddressForClient() throws IOException {
@@ -364,6 +371,12 @@ public class RpcClient implements ClientProtocol {
         Boolean.FALSE : bucketArgs.getVersioning();
     StorageType storageType = bucketArgs.getStorageType() == null ?
         StorageType.DEFAULT : bucketArgs.getStorageType();
+    BucketEncryptionKeyInfo bek = null;
+    if (bucketArgs.getEncryptionKey() != null) {
+      bek = new BucketEncryptionKeyInfo.Builder()
+          .setKeyName(bucketArgs.getEncryptionKey()).build();
+    }
+
     List<OzoneAcl> listOfAcls = new ArrayList<>();
     //User ACL
     listOfAcls.add(new OzoneAcl(OzoneAcl.OzoneACLType.USER,
@@ -386,9 +399,13 @@ public class RpcClient implements ClientProtocol {
         .setStorageType(storageType)
         .setAcls(listOfAcls.stream().distinct().collect(Collectors.toList()));
 
+    if (bek != null) {
+      builder.setBucketEncryptionKey(bek);
+    }
+
     LOG.info("Creating Bucket: {}/{}, with Versioning {} and " +
-            "Storage Type set to {}", volumeName, bucketName, isVersionEnabled,
-            storageType);
+            "Storage Type set to {} and Encryption set to {} ",
+        volumeName, bucketName, isVersionEnabled, storageType, bek != null);
     ozoneManagerClient.createBucket(builder.build());
   }
 
@@ -471,6 +488,12 @@ public class RpcClient implements ClientProtocol {
   }
 
   @Override
+  @VisibleForTesting
+  public OMFailoverProxyProvider getOMProxyProvider() {
+    return ozoneManagerClient.getOMFailoverProxyProvider();
+  }
+
+  @Override
   public void setBucketVersioning(
       String volumeName, String bucketName, Boolean versioning)
       throws IOException {
@@ -524,7 +547,9 @@ public class RpcClient implements ClientProtocol {
         bucketInfo.getStorageType(),
         bucketInfo.getIsVersionEnabled(),
         bucketInfo.getCreationTime(),
-        bucketInfo.getMetadata());
+        bucketInfo.getMetadata(),
+        bucketInfo.getEncryptionKeyInfo() != null ? bucketInfo
+            .getEncryptionKeyInfo().getKeyName() : null);
   }
 
   @Override
@@ -543,7 +568,9 @@ public class RpcClient implements ClientProtocol {
         bucket.getStorageType(),
         bucket.getIsVersionEnabled(),
         bucket.getCreationTime(),
-        bucket.getMetadata()))
+        bucket.getMetadata(),
+        bucket.getEncryptionKeyInfo() != null ? bucket
+            .getEncryptionKeyInfo().getKeyName() : null))
         .collect(Collectors.toList());
   }
 
@@ -581,12 +608,35 @@ public class RpcClient implements ClientProtocol {
             .setStreamBufferMaxSize(streamBufferMaxSize)
             .setWatchTimeout(watchTimeout)
             .setBlockSize(blockSize)
-            .setChecksum(checksum)
+            .setChecksumType(checksumType)
+            .setBytesPerChecksum(bytesPerChecksum)
             .build();
     groupOutputStream.addPreallocateBlocks(
         openKey.getKeyInfo().getLatestVersionLocations(),
         openKey.getOpenVersion());
-    return new OzoneOutputStream(groupOutputStream);
+    final FileEncryptionInfo feInfo = groupOutputStream
+        .getFileEncryptionInfo();
+    if (feInfo != null) {
+      KeyProvider.KeyVersion decrypted = getDEK(feInfo);
+      final CryptoOutputStream cryptoOut = new CryptoOutputStream(
+          groupOutputStream, OzoneKMSUtil.getCryptoCodec(conf, feInfo),
+          decrypted.getMaterial(), feInfo.getIV());
+      return new OzoneOutputStream(cryptoOut);
+    } else {
+      return new OzoneOutputStream(groupOutputStream);
+    }
+  }
+
+  private KeyProvider.KeyVersion getDEK(FileEncryptionInfo feInfo)
+      throws IOException {
+    // check crypto protocol version
+    OzoneKMSUtil.checkCryptoProtocolVersion(feInfo);
+    KeyProvider.KeyVersion decrypted;
+    // TODO: support get kms uri from om rpc server.
+    decrypted = OzoneKMSUtil.decryptEncryptedDataEncryptionKey(feInfo,
+        OzoneKMSUtil.getKeyProvider(conf, OzoneKMSUtil.getKeyProviderUri(
+            ugi, null, null, conf)));
+    return decrypted;
   }
 
   @Override
@@ -605,7 +655,16 @@ public class RpcClient implements ClientProtocol {
     LengthInputStream lengthInputStream =
         KeyInputStream.getFromOmKeyInfo(
             keyInfo, xceiverClientManager, storageContainerLocationClient,
-            requestId);
+            requestId, verifyChecksum);
+    FileEncryptionInfo feInfo = keyInfo.getFileEncryptionInfo();
+    if (feInfo != null) {
+      final KeyProvider.KeyVersion decrypted  = getDEK(feInfo);
+      final CryptoInputStream cryptoIn =
+          new CryptoInputStream(lengthInputStream.getWrappedStream(),
+              OzoneKMSUtil.getCryptoCodec(conf, feInfo),
+              decrypted.getMaterial(), feInfo.getIV());
+      return new OzoneInputStream(cryptoIn);
+    }
     return new OzoneInputStream(lengthInputStream.getWrappedStream());
   }
 
@@ -676,7 +735,8 @@ public class RpcClient implements ClientProtocol {
     return new OzoneKeyDetails(keyInfo.getVolumeName(), keyInfo.getBucketName(),
         keyInfo.getKeyName(), keyInfo.getDataSize(), keyInfo.getCreationTime(),
         keyInfo.getModificationTime(), ozoneKeyLocations, ReplicationType
-        .valueOf(keyInfo.getType().toString()), keyInfo.getMetadata());
+        .valueOf(keyInfo.getType().toString()), keyInfo.getMetadata(),
+        keyInfo.getFileEncryptionInfo());
   }
 
   @Override
@@ -736,7 +796,9 @@ public class RpcClient implements ClientProtocol {
         bucket.getStorageType(),
         bucket.getIsVersionEnabled(),
         bucket.getCreationTime(),
-        bucket.getMetadata()))
+        bucket.getMetadata(),
+        bucket.getEncryptionKeyInfo() != null ?
+            bucket.getEncryptionKeyInfo().getKeyName(): null))
         .collect(Collectors.toList());
   }
 
@@ -778,8 +840,8 @@ public class RpcClient implements ClientProtocol {
       throws IOException {
     HddsClientUtils.verifyResourceName(volumeName, bucketName);
     HddsClientUtils.checkNotNull(keyName, uploadID);
-    Preconditions.checkArgument(partNumber > 0, "Part number should be " +
-        "greater than zero");
+    Preconditions.checkArgument(partNumber > 0 && partNumber <=10000, "Part " +
+        "number should be greater than zero and less than or equal to 10000");
     Preconditions.checkArgument(size >=0, "size should be greater than or " +
         "equal to zero");
     String requestId = UUID.randomUUID().toString();
@@ -808,7 +870,8 @@ public class RpcClient implements ClientProtocol {
             .setStreamBufferMaxSize(streamBufferMaxSize)
             .setWatchTimeout(watchTimeout)
             .setBlockSize(blockSize)
-            .setChecksum(checksum)
+            .setBytesPerChecksum(bytesPerChecksum)
+            .setChecksumType(checksumType)
             .setMultipartNumber(partNumber)
             .setMultipartUploadID(uploadID)
             .setIsMultipartKey(true)
@@ -856,6 +919,37 @@ public class RpcClient implements ClientProtocol {
         .setMultipartUploadID(uploadID)
         .build();
     ozoneManagerClient.abortMultipartUpload(omKeyArgs);
+  }
+
+  @Override
+  public OzoneMultipartUploadPartListParts listParts(String volumeName,
+      String bucketName, String keyName, String uploadID, int partNumberMarker,
+      int maxParts)  throws IOException {
+    HddsClientUtils.verifyResourceName(volumeName, bucketName);
+    HddsClientUtils.checkNotNull(uploadID);
+    Preconditions.checkArgument(maxParts > 0, "Max Parts Should be greater " +
+        "than zero");
+    Preconditions.checkArgument(partNumberMarker >= 0, "Part Number Marker " +
+        "Should be greater than or equal to zero, as part numbers starts from" +
+        " 1 and ranges till 10000");
+    OmMultipartUploadListParts omMultipartUploadListParts =
+        ozoneManagerClient.listParts(volumeName, bucketName, keyName,
+            uploadID, partNumberMarker, maxParts);
+
+    OzoneMultipartUploadPartListParts ozoneMultipartUploadPartListParts =
+        new OzoneMultipartUploadPartListParts(ReplicationType.valueOf(
+            omMultipartUploadListParts.getReplicationType().toString()),
+            omMultipartUploadListParts.getNextPartNumberMarker(),
+            omMultipartUploadListParts.isTruncated());
+
+    for (OmPartInfo omPartInfo : omMultipartUploadListParts.getPartInfoList()) {
+      ozoneMultipartUploadPartListParts.addPart(
+          new OzoneMultipartUploadPartListParts.PartInfo(
+              omPartInfo.getPartNumber(), omPartInfo.getPartName(),
+              omPartInfo.getModificationTime(), omPartInfo.getSize()));
+    }
+    return ozoneMultipartUploadPartListParts;
+
   }
 
 }

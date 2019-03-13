@@ -25,6 +25,7 @@ import org.apache.hadoop.metrics2.annotation.Metric;
 import org.apache.hadoop.metrics2.annotation.Metrics;
 import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
 import org.apache.hadoop.metrics2.lib.MutableCounterLong;
+import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
 
 /**
  * This class is for maintaining Ozone Manager statistics.
@@ -92,6 +93,8 @@ public class OMMetrics {
   private @Metric MutableCounterLong numCompleteMultipartUploadFails;
   private @Metric MutableCounterLong numAbortMultipartUploads;
   private @Metric MutableCounterLong numAbortMultipartUploadFails;
+  private @Metric MutableCounterLong numListMultipartUploadParts;
+  private @Metric MutableCounterLong numListMultipartUploadPartFails;
 
   // Metrics for total number of volumes, buckets and keys
 
@@ -103,6 +106,10 @@ public class OMMetrics {
   // few minutes before restart may not be included in this count.
   private @Metric MutableCounterLong numKeys;
 
+  // Metrics to track checkpointing statistics from last run.
+  private @Metric MutableGaugeLong lastCheckpointCreationTimeTaken;
+  private @Metric MutableGaugeLong lastCheckpointTarOperationTimeTaken;
+  private @Metric MutableGaugeLong lastCheckpointStreamingTimeTaken;
 
   public OMMetrics() {
   }
@@ -269,6 +276,15 @@ public class OMMetrics {
     numAbortMultipartUploadFails.incr();
   }
 
+  public void incNumListMultipartUploadParts() {
+    numKeyOps.incr();
+    numListMultipartUploadParts.incr();
+  }
+
+  public void incNumListMultipartUploadPartFails() {
+    numListMultipartUploadPartFails.incr();
+  }
+
   public void incNumGetServiceLists() {
     numGetServiceLists.incr();
   }
@@ -377,6 +393,18 @@ public class OMMetrics {
 
   public void incNumGetServiceListFails() {
     numGetServiceListFails.incr();
+  }
+
+  public void setLastCheckpointCreationTimeTaken(long val) {
+    this.lastCheckpointCreationTimeTaken.set(val);
+  }
+
+  public void setLastCheckpointTarOperationTimeTaken(long val) {
+    this.lastCheckpointTarOperationTimeTaken.set(val);
+  }
+
+  public void setLastCheckpointStreamingTimeTaken(long val) {
+    this.lastCheckpointStreamingTimeTaken.set(val);
   }
 
   @VisibleForTesting
@@ -593,6 +621,21 @@ public class OMMetrics {
 
   public long getNumAbortMultipartUploadFails() {
     return numAbortMultipartUploadFails.value();
+  }
+
+  @VisibleForTesting
+  public long getLastCheckpointCreationTimeTaken() {
+    return lastCheckpointCreationTimeTaken.value();
+  }
+
+  @VisibleForTesting
+  public long getLastCheckpointTarOperationTimeTaken() {
+    return lastCheckpointTarOperationTimeTaken.value();
+  }
+
+  @VisibleForTesting
+  public long getLastCheckpointStreamingTimeTaken() {
+    return lastCheckpointStreamingTimeTaken.value();
   }
 
   public void unRegister() {

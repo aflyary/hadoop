@@ -142,7 +142,7 @@ public class TestBlockDeletion {
 
     OmKeyArgs keyArgs = new OmKeyArgs.Builder().setVolumeName(volumeName)
         .setBucketName(bucketName).setKeyName(keyName).setDataSize(0)
-        .setType(HddsProtos.ReplicationType.STAND_ALONE)
+        .setType(HddsProtos.ReplicationType.RATIS)
         .setFactor(HddsProtos.ReplicationFactor.ONE).build();
     List<OmKeyLocationInfoGroup> omKeyLocationInfoGroupList =
         om.lookupKey(keyArgs).getKeyLocationVersions();
@@ -220,9 +220,9 @@ public class TestBlockDeletion {
   private void verifyTransactionsCommitted() throws IOException {
     DeletedBlockLogImpl deletedBlockLog =
         (DeletedBlockLogImpl) scm.getScmBlockManager().getDeletedBlockLog();
-    for (int txnID = 1; txnID <= maxTransactionId; txnID++) {
+    for (long txnID = 1; txnID <= maxTransactionId; txnID++) {
       Assert.assertNull(
-          deletedBlockLog.getDeletedStore().get(Longs.toByteArray(txnID)));
+          scm.getScmMetadataStore().getDeletedBlocksTXTable().get(txnID));
     }
   }
 

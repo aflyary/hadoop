@@ -165,6 +165,7 @@ message ContainerWithPipeline {
 }
 
 message GetScmInfoRequestProto {
+    optional string traceID = 1;
 }
 
 message GetScmInfoRespsonseProto {
@@ -196,6 +197,12 @@ enum ScmOps {
     listContainer = 9;
     deleteContainer = 10;
     queryNode = 11;
+}
+
+message ExcludeListProto {
+    repeated string datanodes = 1;
+    repeated int64 containerIds = 2;
+    repeated PipelineID pipelineIds = 3;
 }
 
 /**

@@ -95,6 +95,37 @@ public class OzoneBucket extends WithMetadata {
   private long creationTime;
 
   /**
+   * Bucket Encryption key name if bucket encryption is enabled.
+   */
+  private String encryptionKeyName;
+
+  @SuppressWarnings("parameternumber")
+  public OzoneBucket(Configuration conf, ClientProtocol proxy,
+                     String volumeName, String bucketName,
+                     List<OzoneAcl> acls, StorageType storageType,
+                     Boolean versioning, long creationTime,
+                     Map<String, String> metadata,
+                     String encryptionKeyName) {
+    Preconditions.checkNotNull(proxy, "Client proxy is not set.");
+    this.proxy = proxy;
+    this.volumeName = volumeName;
+    this.name = bucketName;
+    this.acls = acls;
+    this.storageType = storageType;
+    this.versioning = versioning;
+    this.listCacheSize = HddsClientUtils.getListCacheSize(conf);
+    this.creationTime = creationTime;
+    this.defaultReplication = ReplicationFactor.valueOf(conf.getInt(
+        OzoneConfigKeys.OZONE_REPLICATION,
+        OzoneConfigKeys.OZONE_REPLICATION_DEFAULT));
+    this.defaultReplicationType = ReplicationType.valueOf(conf.get(
+        OzoneConfigKeys.OZONE_REPLICATION_TYPE,
+        OzoneConfigKeys.OZONE_REPLICATION_TYPE_DEFAULT));
+    this.metadata = metadata;
+    this.encryptionKeyName = encryptionKeyName;
+  }
+
+  /**
    * Constructs OzoneBucket instance.
    * @param conf Configuration object.
    * @param proxy ClientProtocol proxy.
@@ -199,6 +230,14 @@ public class OzoneBucket extends WithMetadata {
    */
   public long getCreationTime() {
     return creationTime;
+  }
+
+  /**
+   * Return the bucket encryption key name.
+   * @return the bucket encryption key name
+   */
+  public String getEncryptionKeyName() {
+    return encryptionKeyName;
   }
 
   /**
@@ -405,6 +444,28 @@ public class OzoneBucket extends WithMetadata {
       IOException {
     proxy.abortMultipartUpload(volumeName, name, keyName, uploadID);
   }
+
+  /**
+   * Returns list of parts of a multipart upload key.
+   * @param keyName
+   * @param uploadID
+   * @param partNumberMarker
+   * @param maxParts
+   * @return OzoneMultipartUploadPartListParts
+   */
+  public OzoneMultipartUploadPartListParts listParts(String keyName,
+      String uploadID, int partNumberMarker, int maxParts)  throws IOException {
+    // As at most we  can have 10000 parts for a key, not using iterator. If
+    // needed, it can be done later. So, if we send 10000 as max parts at
+    // most in a single rpc call, we return 0.6 mb, by assuming each part
+    // size as 60 bytes (ignored the replication type size during calculation)
+
+    return proxy.listParts(volumeName, name, keyName, uploadID,
+              partNumberMarker, maxParts);
+  }
+
+
+
 
   /**
    * An Iterator to iterate over {@link OzoneKey} list.

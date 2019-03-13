@@ -19,16 +19,18 @@ package org.apache.hadoop.ozone.om.ratis;
 
 import java.io.Closeable;
 import java.io.IOException;
-import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
+
 import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.ServiceException;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.ozone.OmUtils;
 import org.apache.hadoop.ozone.om.OMConfigKeys;
+import org.apache.hadoop.ozone.om.helpers.OMRatisHelper;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
     .OMRequest;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos
@@ -55,24 +57,24 @@ public final class OzoneManagerRatisClient implements Closeable {
       OzoneManagerRatisClient.class);
 
   private final RaftGroup raftGroup;
-  private final String omID;
+  private final String omNodeID;
   private final RpcType rpcType;
-  private final AtomicReference<RaftClient> client = new AtomicReference<>();
+  private RaftClient raftClient;
   private final RetryPolicy retryPolicy;
   private final Configuration conf;
 
-  private OzoneManagerRatisClient(String omId, RaftGroup raftGroup,
+  private OzoneManagerRatisClient(String omNodeId, RaftGroup raftGroup,
       RpcType rpcType, RetryPolicy retryPolicy,
       Configuration config) {
     this.raftGroup = raftGroup;
-    this.omID = omId;
+    this.omNodeID = omNodeId;
     this.rpcType = rpcType;
     this.retryPolicy = retryPolicy;
     this.conf = config;
   }
 
   public static OzoneManagerRatisClient newOzoneManagerRatisClient(
-      String omId, RaftGroup raftGroup, Configuration conf) {
+      String omNodeId, RaftGroup raftGroup, Configuration conf) {
     final String rpcType = conf.get(
         OMConfigKeys.OZONE_OM_RATIS_RPC_TYPE_KEY,
         OMConfigKeys.OZONE_OM_RATIS_RPC_TYPE_DEFAULT);
@@ -89,42 +91,31 @@ public final class OzoneManagerRatisClient implements Closeable {
     final RetryPolicy retryPolicy = RetryPolicies
         .retryUpToMaximumCountWithFixedSleep(maxRetryCount, sleepDuration);
 
-    return new OzoneManagerRatisClient(omId, raftGroup,
+    return new OzoneManagerRatisClient(omNodeId, raftGroup,
         SupportedRpcType.valueOfIgnoreCase(rpcType), retryPolicy, conf);
   }
 
   public void connect() {
     LOG.debug("Connecting to OM Ratis Server GroupId:{} OM:{}",
-        raftGroup.getGroupId().getUuid().toString(), omID);
+        raftGroup.getGroupId().getUuid().toString(), omNodeID);
 
     // TODO : XceiverClient ratis should pass the config value of
     // maxOutstandingRequests so as to set the upper bound on max no of async
     // requests to be handled by raft client
 
-    if (!client.compareAndSet(null, OMRatisHelper.newRaftClient(
-        rpcType, omID, raftGroup, retryPolicy, conf))) {
-      throw new IllegalStateException("Client is already connected.");
-    }
+    raftClient = OMRatisHelper.newRaftClient(rpcType, omNodeID, raftGroup,
+        retryPolicy, conf);
   }
 
   @Override
   public void close() {
-    final RaftClient c = client.getAndSet(null);
-    if (c != null) {
-      closeRaftClient(c);
+    if (raftClient != null) {
+      try {
+        raftClient.close();
+      } catch (IOException e) {
+        throw new IllegalStateException(e);
+      }
     }
-  }
-
-  private void closeRaftClient(RaftClient raftClient) {
-    try {
-      raftClient.close();
-    } catch (IOException e) {
-      throw new IllegalStateException(e);
-    }
-  }
-
-  private RaftClient getClient() {
-    return Objects.requireNonNull(client.get(), "client is null");
   }
 
   /**
@@ -132,13 +123,12 @@ public final class OzoneManagerRatisClient implements Closeable {
    * @param request Request
    * @return Response to the command
    */
-  public OMResponse sendCommand(OMRequest request) {
+  public OMResponse sendCommand(OMRequest request) throws ServiceException {
     try {
       CompletableFuture<OMResponse> reply = sendCommandAsync(request);
       return reply.get();
     } catch (ExecutionException | InterruptedException e) {
-      LOG.error("Failed to execute command: " + request, e);
-      return OMRatisHelper.getErrorResponse(request.getCmdType(), e);
+      throw new ServiceException(e);
     }
   }
 
@@ -165,9 +155,10 @@ public final class OzoneManagerRatisClient implements Closeable {
                 if (raftRetryFailureException != null) {
                   throw new CompletionException(raftRetryFailureException);
                 }
+
                 OMResponse response = OMRatisHelper
-                    .convertByteStringToOMResponse(reply.getMessage()
-                        .getContent());
+                    .getOMResponseFromRaftClientReply(reply);
+
                 return response;
               } catch (InvalidProtocolBufferException e) {
                 throw new CompletionException(e);
@@ -188,7 +179,7 @@ public final class OzoneManagerRatisClient implements Closeable {
     boolean isReadOnlyRequest = OmUtils.isReadOnly(request);
     ByteString byteString = OMRatisHelper.convertRequestToByteString(request);
     LOG.debug("sendOMRequestAsync {} {}", isReadOnlyRequest, request);
-    return isReadOnlyRequest ? getClient().sendReadOnlyAsync(() -> byteString) :
-        getClient().sendAsync(() -> byteString);
+    return isReadOnlyRequest ? raftClient.sendReadOnlyAsync(() -> byteString) :
+        raftClient.sendAsync(() -> byteString);
   }
 }

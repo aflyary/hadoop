@@ -17,9 +17,13 @@
 package org.apache.hadoop.hdds.scm;
 
 import com.google.common.base.Preconditions;
-import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.PipelineAction;
-import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ClosePipelineInfo;
-import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.PipelineActionsProto;
+import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.PipelineAction;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.ClosePipelineInfo;
+import org.apache.hadoop.hdds.protocol.proto
+    .StorageContainerDatanodeProtocolProtos.PipelineActionsProto;
 import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.ContainerReplicaProto;
 import org.apache.hadoop.hdds.protocol.proto
@@ -27,7 +31,9 @@ import org.apache.hadoop.hdds.protocol.proto
 import org.apache.hadoop.hdds.protocol.proto
         .StorageContainerDatanodeProtocolProtos.PipelineReportsProto;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineID;
-import org.apache.hadoop.hdds.scm.server.SCMDatanodeHeartbeatDispatcher.PipelineActionsFromDatanode;
+import org.apache.hadoop.hdds.scm.server.SCMConfigurator;
+import org.apache.hadoop.hdds.scm.server
+    .SCMDatanodeHeartbeatDispatcher.PipelineActionsFromDatanode;
 import org.apache.hadoop.hdds.scm.server
     .SCMDatanodeHeartbeatDispatcher.PipelineReportFromDatanode;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
@@ -48,8 +54,13 @@ import org.apache.hadoop.hdds.protocol.proto
     .StorageContainerDatanodeProtocolProtos.StorageTypeProto;
 import org.apache.hadoop.hdds.scm.node.SCMNodeManager;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.scm.server.SCMStorageConfig;
+import org.apache.hadoop.hdds.scm.server.StorageContainerManager;
 import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.common.Storage;
 import org.apache.hadoop.ozone.protocol.commands.RegisteredCommand;
+import org.apache.hadoop.security.authentication.client
+    .AuthenticationException;
 
 import java.io.File;
 import java.io.IOException;
@@ -58,6 +69,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
+
+import static org.apache.hadoop.ozone.OzoneConfigKeys.OZONE_ENABLED;
 
 /**
  * Stateless helper functions to handler scm/datanode connection.
@@ -433,7 +446,7 @@ public final class TestUtils {
       allocateContainer(ContainerManager containerManager)
       throws IOException {
     return containerManager
-        .allocateContainer(HddsProtos.ReplicationType.STAND_ALONE,
+        .allocateContainer(HddsProtos.ReplicationType.RATIS,
             HddsProtos.ReplicationFactor.THREE, "root");
 
   }
@@ -446,4 +459,66 @@ public final class TestUtils {
         id, HddsProtos.LifeCycleEvent.CLOSE);
 
   }
+
+  /**
+   * Move the container to Quaise close state.
+   * @param containerManager
+   * @param id
+   * @throws IOException
+   */
+  public static void quasiCloseContainer(ContainerManager containerManager,
+      ContainerID id) throws IOException {
+    containerManager.updateContainerState(
+        id, HddsProtos.LifeCycleEvent.FINALIZE);
+    containerManager.updateContainerState(
+        id, HddsProtos.LifeCycleEvent.QUASI_CLOSE);
+
+  }
+
+  /**
+   * Construct and returns StorageContainerManager instance using the given
+   * configuration. The ports used by this StorageContainerManager are
+   * randomly selected from free ports available.
+   *
+   * @param conf OzoneConfiguration
+   * @return StorageContainerManager instance
+   * @throws IOException
+   * @throws AuthenticationException
+   */
+  public static StorageContainerManager getScm(OzoneConfiguration conf)
+      throws IOException, AuthenticationException {
+    return getScm(conf, new SCMConfigurator());
+  }
+
+  /**
+   * Construct and returns StorageContainerManager instance using the given
+   * configuration and the configurator. The ports used by this
+   * StorageContainerManager are randomly selected from free ports available.
+   *
+   * @param conf OzoneConfiguration
+   * @param configurator SCMConfigurator
+   * @return StorageContainerManager instance
+   * @throws IOException
+   * @throws AuthenticationException
+   */
+  public static StorageContainerManager getScm(OzoneConfiguration conf,
+                                               SCMConfigurator configurator)
+      throws IOException, AuthenticationException {
+    conf.setBoolean(OZONE_ENABLED, true);
+    conf.set(ScmConfigKeys.OZONE_SCM_CLIENT_ADDRESS_KEY, "127.0.0.1:0");
+    conf.set(ScmConfigKeys.OZONE_SCM_BLOCK_CLIENT_ADDRESS_KEY, "127.0.0.1:0");
+    conf.set(ScmConfigKeys.OZONE_SCM_DATANODE_ADDRESS_KEY, "127.0.0.1:0");
+    conf.set(ScmConfigKeys.OZONE_SCM_HTTP_ADDRESS_KEY, "127.0.0.1:0");
+    SCMStorageConfig scmStore = new SCMStorageConfig(conf);
+    if(scmStore.getState() != Storage.StorageState.INITIALIZED) {
+      String clusterId = UUID.randomUUID().toString();
+      String scmId = UUID.randomUUID().toString();
+      scmStore.setClusterId(clusterId);
+      scmStore.setScmId(scmId);
+      // writes the version file properties
+      scmStore.initialize();
+    }
+    return new StorageContainerManager(conf, configurator);
+  }
+
 }

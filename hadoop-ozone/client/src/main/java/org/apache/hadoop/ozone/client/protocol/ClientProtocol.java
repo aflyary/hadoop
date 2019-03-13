@@ -18,8 +18,8 @@
 
 package org.apache.hadoop.ozone.client.protocol;
 
+import com.google.common.annotations.VisibleForTesting;
 import org.apache.hadoop.hdds.protocol.StorageType;
-import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.client.*;
@@ -28,6 +28,8 @@ import org.apache.hadoop.hdds.client.ReplicationFactor;
 import org.apache.hadoop.hdds.client.ReplicationType;
 import org.apache.hadoop.ozone.client.io.OzoneInputStream;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
+import org.apache.hadoop.ozone.om.ha.OMFailoverProxyProvider;
+import org.apache.hadoop.ozone.om.OMConfigKeys;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadCompleteInfo;
 
@@ -48,7 +50,7 @@ import org.apache.hadoop.security.token.Token;
  * includes: {@link org.apache.hadoop.ozone.client.rpc.RpcClient} for RPC and
  * {@link  org.apache.hadoop.ozone.client.rest.RestClient} for REST.
  */
-@KerberosInfo(serverPrincipal = ScmConfigKeys.HDDS_SCM_KERBEROS_PRINCIPAL_KEY)
+@KerberosInfo(serverPrincipal = OMConfigKeys.OZONE_OM_KERBEROS_PRINCIPAL_KEY)
 public interface ClientProtocol {
 
   /**
@@ -455,6 +457,22 @@ public interface ClientProtocol {
       String bucketName, String keyName, String uploadID) throws IOException;
 
   /**
+   * Returns list of parts of a multipart upload key.
+   * @param volumeName
+   * @param bucketName
+   * @param keyName
+   * @param uploadID
+   * @param partNumberMarker - returns parts with part number which are greater
+   * than this partNumberMarker.
+   * @param maxParts
+   * @return OmMultipartUploadListParts
+   */
+  OzoneMultipartUploadPartListParts listParts(String volumeName,
+      String bucketName, String keyName, String uploadID, int partNumberMarker,
+      int maxParts)  throws IOException;
+
+
+  /**
    * Get a valid Delegation Token.
    *
    * @param renewer the designated renewer for the token
@@ -490,4 +508,7 @@ public interface ClientProtocol {
    * @throws IOException
    */
   S3SecretValue getS3Secret(String kerberosID) throws IOException;
+
+  @VisibleForTesting
+  OMFailoverProxyProvider getOMProxyProvider();
 }

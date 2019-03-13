@@ -69,6 +69,7 @@ enum Type {
   CompleteMultiPartUpload = 47;
   AbortMultiPartUpload = 48;
   GetS3Secret = 49;
+  ListMultiPartUploadParts = 50;
 
   ServiceList = 51;
 
@@ -116,6 +117,7 @@ message OMRequest {
   optional MultipartUploadCompleteRequest   completeMultiPartUploadRequest = 47;
   optional MultipartUploadAbortRequest      abortMultiPartUploadRequest    = 48;
   optional GetS3SecretRequest               getS3SecretRequest             = 49;
+  optional MultipartUploadListPartsRequest  listMultipartUploadPartsRequest = 50;
 
   optional ServiceListRequest               serviceListRequest             = 51;
 
@@ -133,7 +135,12 @@ message OMResponse {
   optional string traceID = 2;
 
   optional bool success = 3 [default=true];
+
   optional string message = 4;
+
+  required Status status = 5;
+
+  optional string leaderOMNodeId = 6;
 
   optional CreateVolumeResponse              createVolumeResponse          = 11;
   optional SetVolumePropertyResponse         setVolumePropertyResponse     = 12;
@@ -165,6 +172,7 @@ message OMResponse {
   optional MultipartUploadCompleteResponse completeMultiPartUploadResponse = 47;
   optional MultipartUploadAbortResponse    abortMultiPartUploadResponse    = 48;
   optional GetS3SecretResponse               getS3SecretResponse           = 49;
+  optional MultipartUploadListPartsResponse listMultipartUploadPartsResponse = 50;
 
   optional ServiceListResponse               ServiceListResponse           = 51;
 
@@ -213,6 +221,14 @@ enum Status {
     INVALID_TOKEN = 34;
     TOKEN_EXPIRED = 35;
     TOKEN_ERROR_OTHER = 36;
+    LIST_MULTIPART_UPLOAD_PARTS_FAILED = 37;
+    SCM_IN_CHILL_MODE = 38;
+    INVALID_REQUEST = 39;
+
+    BUCKET_ENCRYPTION_KEY_NOT_FOUND = 40;
+    UNKNOWN_CIPHER_SUITE = 41;
+    INVALID_KMS_PROVIDER = 42;
+    TOKEN_CREATION_ERROR = 43;
 
 }
 
@@ -235,7 +251,7 @@ message CreateVolumeRequest {
 }
 
 message CreateVolumeResponse {
-    required Status status = 1;
+
 }
 
 message VolumeList {
@@ -252,7 +268,7 @@ message SetVolumePropertyRequest {
 }
 
 message SetVolumePropertyResponse {
-    required Status status = 1;
+
 }
 
 /**
@@ -265,7 +281,6 @@ message CheckVolumeAccessRequest {
 
 message CheckVolumeAccessResponse {
 
-    required Status status = 1;
 }
 
 
@@ -278,7 +293,6 @@ message InfoVolumeRequest {
 }
 
 message InfoVolumeResponse {
-    required Status status = 1;
     optional VolumeInfo volumeInfo = 2;
 }
 
@@ -290,7 +304,7 @@ message DeleteVolumeRequest {
 }
 
 message DeleteVolumeResponse {
-    required Status status = 1;
+
 }
 
 
@@ -312,7 +326,6 @@ message ListVolumeRequest {
 }
 
 message ListVolumeResponse {
-    required Status status = 1;
     repeated VolumeInfo volumeInfo = 2;
 }
 
@@ -324,7 +337,7 @@ message BucketInfo {
     required StorageTypeProto storageType = 5 [default = DISK];
     required uint64 creationTime = 6;
     repeated hadoop.hdds.KeyValue metadata = 7;
-
+    optional BucketEncryptionInfoProto beinfo = 8;
 }
 
 enum StorageTypeProto {
@@ -332,6 +345,60 @@ enum StorageTypeProto {
     SSD = 2;
     ARCHIVE = 3;
     RAM_DISK = 4;
+}
+
+/**
+ * Cipher suite.
+ */
+enum CipherSuiteProto {
+    UNKNOWN = 1;
+    AES_CTR_NOPADDING = 2;
+}
+
+/**
+ * Crypto protocol version used to access encrypted files.
+ */
+enum CryptoProtocolVersionProto {
+    UNKNOWN_PROTOCOL_VERSION = 1;
+    ENCRYPTION_ZONES = 2;
+}
+/**
+ * Encryption information for bucket (bucket key)
+ */
+message BucketEncryptionInfoProto {
+    required string keyName = 1;
+    optional CipherSuiteProto suite = 2;
+    optional CryptoProtocolVersionProto cryptoProtocolVersion = 3;
+}
+
+/**
+ * Encryption information for a file.
+ */
+message FileEncryptionInfoProto {
+    required CipherSuiteProto suite = 1;
+    required CryptoProtocolVersionProto cryptoProtocolVersion = 2;
+    required bytes key = 3;
+    required bytes iv = 4;
+    required string keyName = 5;
+    required string ezKeyVersionName = 6;
+}
+
+/**
+ * Encryption information for an individual
+ * file within an encryption zone
+ */
+message PerFileEncryptionInfoProto {
+    required bytes key = 1;
+    required bytes iv = 2;
+    required string ezKeyVersionName = 3;
+}
+
+message DataEncryptionKeyProto {
+    required uint32 keyId = 1;
+    required bytes nonce = 3;
+    required bytes encryptionKey = 4;
+    required uint64 expiryDate = 5;
+    optional string encryptionAlgorithm = 6;
 }
 
 message BucketArgs {
@@ -365,7 +432,7 @@ message CreateBucketRequest {
 }
 
 message CreateBucketResponse {
-    required Status status = 1;
+
 }
 
 message InfoBucketRequest {
@@ -374,7 +441,7 @@ message InfoBucketRequest {
 }
 
 message InfoBucketResponse {
-    required Status status = 1;
+
     optional BucketInfo bucketInfo = 2;
 }
 
@@ -383,7 +450,7 @@ message SetBucketPropertyRequest {
 }
 
 message SetBucketPropertyResponse {
-    required Status status = 1;
+
 }
 
 message DeleteBucketRequest {
@@ -392,7 +459,7 @@ message DeleteBucketRequest {
 }
 
 message DeleteBucketResponse {
-    required Status status = 1;
+
 }
 
 message ListBucketsRequest {
@@ -403,7 +470,7 @@ message ListBucketsRequest {
 }
 
 message ListBucketsResponse {
-    required Status status = 1;
+
     repeated BucketInfo bucketInfo = 2;
 }
 
@@ -433,6 +500,7 @@ message KeyLocation {
 message KeyLocationList {
     optional uint64 version = 1;
     repeated KeyLocation keyLocations = 2;
+    optional FileEncryptionInfoProto fileEncryptionInfo = 3;
 }
 
 message KeyInfo {
@@ -447,7 +515,7 @@ message KeyInfo {
     required uint64 modificationTime = 9;
     optional uint64 latestVersion = 10;
     repeated hadoop.hdds.KeyValue metadata = 11;
-
+    optional FileEncryptionInfoProto fileEncryptionInfo = 12;
 }
 
 message CreateKeyRequest {
@@ -455,7 +523,7 @@ message CreateKeyRequest {
 }
 
 message CreateKeyResponse {
-    required Status status = 1;
+
     optional KeyInfo keyInfo = 2;
     // clients' followup request may carry this ID for stateful operations
     // (similar to a cookie).
@@ -468,7 +536,7 @@ message LookupKeyRequest {
 }
 
 message LookupKeyResponse {
-    required Status status = 1;
+
     optional KeyInfo keyInfo = 2;
     // clients' followup request may carry this ID for stateful operations (similar
     // to a cookie).
@@ -483,7 +551,7 @@ message RenameKeyRequest{
 }
 
 message RenameKeyResponse{
-    required Status status = 1;
+
 }
 
 message DeleteKeyRequest {
@@ -491,7 +559,7 @@ message DeleteKeyRequest {
 }
 
 message DeleteKeyResponse {
-    required Status status = 1;
+
     optional KeyInfo keyInfo = 2;
     // clients' followup request may carry this ID for stateful operations
     // (similar to a cookie).
@@ -500,15 +568,24 @@ message DeleteKeyResponse {
 }
 
 message OMTokenProto {
-    optional uint32 version        = 1;
-    optional string owner          = 2;
-    optional string renewer        = 3;
-    optional string realUser       = 4;
-    optional uint64 issueDate      = 5;
-    optional uint64 maxDate        = 6;
-    optional uint32 sequenceNumber = 7;
-    optional uint32 masterKeyId    = 8;
-    optional uint64 expiryDate     = 9;
+    enum Type {
+      DELEGATION_TOKEN = 1;
+      S3TOKEN = 2;
+    };
+    required Type   type           = 1;
+    optional uint32 version        = 2;
+    optional string owner          = 3;
+    optional string renewer        = 4;
+    optional string realUser       = 5;
+    optional uint64 issueDate      = 6;
+    optional uint64 maxDate        = 7;
+    optional uint32 sequenceNumber = 8;
+    optional uint32 masterKeyId    = 9;
+    optional uint64 expiryDate     = 10;
+    optional string omCertSerialId = 11;
+    optional string accessKeyId    = 12;
+    optional string signature      = 13;
+    optional string strToSign      = 14;
 }
 
 message SecretKeyProto {
@@ -527,7 +604,7 @@ message ListKeysRequest {
 }
 
 message ListKeysResponse {
-    required Status status = 1;
+
     repeated KeyInfo keyInfo = 2;
 }
 
@@ -537,16 +614,17 @@ message CommitKeyRequest {
 }
 
 message CommitKeyResponse {
-    required Status status = 1;
+
 }
 
 message AllocateBlockRequest {
     required KeyArgs keyArgs = 1;
     required uint64 clientID = 2;
+    optional hadoop.hdds.ExcludeListProto excludeList = 3;
 }
 
 message AllocateBlockResponse {
-    required Status status = 1;
+
     optional KeyLocation keyLocation = 2;
 }
 
@@ -554,7 +632,7 @@ message ServiceListRequest {
 }
 
 message ServiceListResponse {
-    required Status status = 1;
+
     repeated ServiceInfo serviceInfo = 2;
 }
 
@@ -581,7 +659,7 @@ message S3CreateBucketRequest {
 }
 
 message S3CreateBucketResponse {
-    required Status status = 1;
+
 }
 
 message S3DeleteBucketRequest {
@@ -589,14 +667,14 @@ message S3DeleteBucketRequest {
 }
 
 message S3DeleteBucketResponse {
-    required Status status = 1;
+
 }
 
 message S3BucketInfoRequest {
     required string s3bucketName = 1;
 }
 message S3BucketInfoResponse {
-    required Status status = 1;
+
     optional string ozoneMapping = 2;
 }
 
@@ -608,7 +686,7 @@ message S3ListBucketsRequest {
 }
 
 message S3ListBucketsResponse {
-    required Status status = 1;
+
     repeated BucketInfo bucketInfo = 2;
 }
 
@@ -621,7 +699,6 @@ message MultipartInfoInitiateResponse {
     required string bucketName = 2;
     required string keyName = 3;
     required string multipartUploadID = 4;
-    required Status status = 5;
 }
 
 message MultipartKeyInfo {
@@ -643,7 +720,6 @@ message MultipartCommitUploadPartRequest {
 message MultipartCommitUploadPartResponse {
     // This one is returned as Etag for S3.
     optional string partName = 1;
-    required Status status = 2;
 }
 
 message MultipartUploadCompleteRequest {
@@ -656,7 +732,6 @@ message MultipartUploadCompleteResponse {
     optional string bucket = 2;
     optional string key = 3;
     optional string hash = 4; // This will be used as etag for s3
-    required Status status = 5;
 }
 
 message Part {
@@ -669,21 +744,45 @@ message MultipartUploadAbortRequest {
 }
 
 message MultipartUploadAbortResponse {
-    required Status status = 1;
+
+}
+message MultipartUploadListPartsRequest {
+    required string volume = 1;
+    required string bucket = 2;
+    required string key = 3;
+    required string uploadID = 4;
+    optional uint32 partNumbermarker = 5;
+    optional uint32 maxParts = 6;
+}
+
+message MultipartUploadListPartsResponse {
+
+    optional hadoop.hdds.ReplicationType type = 2;
+    optional uint32 nextPartNumberMarker = 3;
+    optional bool isTruncated = 4;
+    repeated PartInfo partsList = 5;
+
+}
+
+message PartInfo {
+    required uint32 partNumber = 1;
+    required string partName = 2;
+    required uint64 modificationTime = 3;
+    required uint64 size = 4;
 }
 
 message GetDelegationTokenResponseProto{
-    required Status status = 1;
+
     optional hadoop.common.GetDelegationTokenResponseProto response = 2;
 }
 
 message RenewDelegationTokenResponseProto{
-    required Status status = 1;
+
     optional hadoop.common.RenewDelegationTokenResponseProto response = 2;
 }
 
 message CancelDelegationTokenResponseProto {
-    required Status status = 1;
+
     optional hadoop.common.CancelDelegationTokenResponseProto response = 2;
 }
 
@@ -697,7 +796,6 @@ message GetS3SecretRequest {
 }
 
 message GetS3SecretResponse {
-    required Status status = 1;
     required S3Secret s3Secret = 2;
 }
 

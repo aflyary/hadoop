@@ -22,20 +22,21 @@ import com.google.common.base.Strings;
 import org.apache.hadoop.conf.StorageUnit;
 import org.apache.hadoop.hdds.client.ReplicationType;
 import org.apache.hadoop.hdds.scm.client.HddsClientUtils;
+import org.apache.hadoop.hdds.scm.protocol.StorageContainerLocationProtocol;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
-import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
+    .ChecksumType;
 import org.apache.hadoop.ozone.client.io.KeyInputStream;
 import org.apache.hadoop.ozone.client.io.KeyOutputStream;
 import org.apache.hadoop.ozone.client.io.LengthInputStream;
-import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.ozone.om.helpers.OmBucketArgs;
 import org.apache.hadoop.ozone.om.helpers.OmBucketInfo;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.helpers.OmVolumeArgs;
 import org.apache.hadoop.ozone.om.helpers.OpenKeySession;
-import org.apache.hadoop.ozone.om.protocolPB.OzoneManagerProtocolClientSideTranslatorPB;
+import org.apache.hadoop.ozone.om.protocol.OzoneManagerProtocol;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.OzoneConsts.Versioning;
@@ -47,8 +48,6 @@ import org.apache.hadoop.ozone.OzoneAcl;
 import org.apache.hadoop.ozone.web.request.OzoneQuota;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.XceiverClientManager;
-import org.apache.hadoop.hdds.scm.protocolPB
-    .StorageContainerLocationProtocolClientSideTranslatorPB;
 import org.apache.hadoop.ozone.client.rest.OzoneException;
 import org.apache.hadoop.ozone.web.handlers.BucketArgs;
 import org.apache.hadoop.ozone.web.handlers.KeyArgs;
@@ -74,9 +73,9 @@ public final class DistributedStorageHandler implements StorageHandler {
   private static final Logger LOG =
       LoggerFactory.getLogger(DistributedStorageHandler.class);
 
-  private final StorageContainerLocationProtocolClientSideTranslatorPB
+  private final StorageContainerLocationProtocol
       storageContainerLocationClient;
-  private final OzoneManagerProtocolClientSideTranslatorPB
+  private final OzoneManagerProtocol
       ozoneManagerClient;
   private final XceiverClientManager xceiverClientManager;
   private final OzoneAcl.OzoneACLRights userRights;
@@ -86,7 +85,9 @@ public final class DistributedStorageHandler implements StorageHandler {
   private final long streamBufferMaxSize;
   private final long watchTimeout;
   private final long blockSize;
-  private final Checksum checksum;
+  private final ChecksumType checksumType;
+  private final int bytesPerChecksum;
+  private final boolean verifyChecksum;
 
   /**
    * Creates a new DistributedStorageHandler.
@@ -96,10 +97,8 @@ public final class DistributedStorageHandler implements StorageHandler {
    * @param ozoneManagerClient OzoneManager proxy
    */
   public DistributedStorageHandler(OzoneConfiguration conf,
-      StorageContainerLocationProtocolClientSideTranslatorPB
-          storageContainerLocation,
-      OzoneManagerProtocolClientSideTranslatorPB
-                                       ozoneManagerClient) {
+      StorageContainerLocationProtocol storageContainerLocation,
+      OzoneManagerProtocol ozoneManagerClient) {
     this.ozoneManagerClient = ozoneManagerClient;
     this.storageContainerLocationClient = storageContainerLocation;
     this.xceiverClientManager = new XceiverClientManager(conf);
@@ -136,23 +135,25 @@ public final class DistributedStorageHandler implements StorageHandler {
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM,
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_DEFAULT,
         StorageUnit.BYTES);
-    int checksumSize;
+
     if(configuredChecksumSize <
         OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE) {
       LOG.warn("The checksum size ({}) is not allowed to be less than the " +
               "minimum size ({}), resetting to the minimum size.",
           configuredChecksumSize,
           OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE);
-      checksumSize = OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE;
+      bytesPerChecksum =
+          OzoneConfigKeys.OZONE_CLIENT_BYTES_PER_CHECKSUM_MIN_SIZE;
     } else {
-      checksumSize = configuredChecksumSize;
+      bytesPerChecksum = configuredChecksumSize;
     }
     String checksumTypeStr = conf.get(
         OzoneConfigKeys.OZONE_CLIENT_CHECKSUM_TYPE,
         OzoneConfigKeys.OZONE_CLIENT_CHECKSUM_TYPE_DEFAULT);
-    ContainerProtos.ChecksumType checksumType = ContainerProtos.ChecksumType
-        .valueOf(checksumTypeStr);
-    this.checksum = new Checksum(checksumType, checksumSize);
+    this.checksumType = ChecksumType.valueOf(checksumTypeStr);
+    this.verifyChecksum =
+        conf.getBoolean(OzoneConfigKeys.OZONE_CLIENT_VERIFY_CHECKSUM,
+            OzoneConfigKeys.OZONE_CLIENT_VERIFY_CHECKSUM_DEFAULT);
   }
 
   @Override
@@ -451,7 +452,8 @@ public final class DistributedStorageHandler implements StorageHandler {
             .setStreamBufferMaxSize(streamBufferMaxSize)
             .setBlockSize(blockSize)
             .setWatchTimeout(watchTimeout)
-            .setChecksum(checksum)
+            .setChecksumType(checksumType)
+            .setBytesPerChecksum(bytesPerChecksum)
             .build();
     groupOutputStream.addPreallocateBlocks(
         openKey.getKeyInfo().getLatestVersionLocations(),
@@ -477,7 +479,7 @@ public final class DistributedStorageHandler implements StorageHandler {
     OmKeyInfo keyInfo = ozoneManagerClient.lookupKey(keyArgs);
     return KeyInputStream.getFromOmKeyInfo(
         keyInfo, xceiverClientManager, storageContainerLocationClient,
-        args.getRequestID());
+        args.getRequestID(), verifyChecksum);
   }
 
   @Override

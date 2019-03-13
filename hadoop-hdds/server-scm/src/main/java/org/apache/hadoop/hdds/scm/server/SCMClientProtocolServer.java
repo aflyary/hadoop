@@ -25,6 +25,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
 import com.google.protobuf.BlockingService;
+import org.apache.hadoop.fs.CommonConfigurationKeys;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
@@ -48,8 +49,6 @@ import org.apache.hadoop.hdds.scm.pipeline.PipelineManager;
 import org.apache.hadoop.hdds.scm.pipeline.RatisPipelineUtils;
 import org.apache.hadoop.hdds.scm.protocol.StorageContainerLocationProtocol;
 import org.apache.hadoop.hdds.scm.protocolPB.StorageContainerLocationProtocolPB;
-import org.apache.hadoop.hdds.server.events.EventHandler;
-import org.apache.hadoop.hdds.server.events.EventPublisher;
 import org.apache.hadoop.io.IOUtils;
 import org.apache.hadoop.ipc.ProtobufRpcEngine;
 import org.apache.hadoop.ipc.RPC;
@@ -94,7 +93,7 @@ import static org.apache.hadoop.hdds.scm.server.StorageContainerManager
  * The RPC server that listens to requests from clients.
  */
 public class SCMClientProtocolServer implements
-    StorageContainerLocationProtocol, EventHandler<Boolean>, Auditor {
+    StorageContainerLocationProtocol, Auditor {
   private static final Logger LOG =
       LoggerFactory.getLogger(SCMClientProtocolServer.class);
   private static final AuditLogger AUDIT =
@@ -133,7 +132,10 @@ public class SCMClientProtocolServer implements
     clientRpcAddress =
         updateRPCListenAddress(conf, OZONE_SCM_CLIENT_ADDRESS_KEY,
             scmAddress, clientRpcServer);
-
+    if (conf.getBoolean(CommonConfigurationKeys.HADOOP_SECURITY_AUTHORIZATION,
+        false)) {
+      clientRpcServer.refreshServiceAcl(conf, SCMPolicyProvider.getInstance());
+    }
   }
 
   public RPC.Server getClientRpcServer() {
@@ -422,8 +424,8 @@ public class SCMClientProtocolServer implements
     try{
       ScmInfo.Builder builder =
           new ScmInfo.Builder()
-              .setClusterId(scm.getScmStorage().getClusterID())
-              .setScmId(scm.getScmStorage().getScmId());
+              .setClusterId(scm.getScmStorageConfig().getClusterID())
+              .setScmId(scm.getScmStorageConfig().getScmId());
       return builder.build();
     } catch (Exception ex) {
       auditSuccess = false;
@@ -493,14 +495,6 @@ public class SCMClientProtocolServer implements
   }
 
   /**
-   * Set chill mode status based on SCMEvents.CHILL_MODE_STATUS event.
-   */
-  @Override
-  public void onMessage(Boolean inChillMode, EventPublisher publisher) {
-    chillModePrecheck.setInChillMode(inChillMode);
-  }
-
-  /**
    * Set chill mode status based on .
    */
   public boolean getChillModeStatus() {
@@ -551,5 +545,19 @@ public class SCMClientProtocolServer implements
         .withResult(AuditEventStatus.FAILURE.toString())
         .withException(throwable)
         .build();
+  }
+
+  @Override
+  public void close() throws IOException {
+    stop();
+  }
+
+  /**
+   * Set ChillMode status.
+   *
+   * @param chillModeStatus
+   */
+  public void setChillModeStatus(boolean chillModeStatus) {
+    chillModePrecheck.setInChillMode(chillModeStatus);
   }
 }

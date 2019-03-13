@@ -25,6 +25,7 @@ import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos;
 import org.apache.hadoop.hdds.scm.TestUtils;
+import org.apache.hadoop.hdds.scm.chillmode.SCMChillModeManager;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.hdds.scm.container.MockNodeManager;
 import org.apache.hadoop.hdds.scm.server.SCMDatanodeHeartbeatDispatcher.PipelineReportFromDatanode;
@@ -37,6 +38,7 @@ import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -69,8 +71,13 @@ public class TestSCMPipelineManager {
 
   @Test
   public void testPipelineReload() throws IOException {
-    PipelineManager pipelineManager =
+    SCMPipelineManager pipelineManager =
         new SCMPipelineManager(conf, nodeManager, new EventQueue());
+    PipelineProvider mockRatisProvider =
+        new MockRatisPipelineProvider(nodeManager,
+            pipelineManager.getStateManager(), conf);
+    pipelineManager.setPipelineProvider(HddsProtos.ReplicationType.RATIS,
+        mockRatisProvider);
     Set<Pipeline> pipelines = new HashSet<>();
     for (int i = 0; i < 5; i++) {
       Pipeline pipeline = pipelineManager
@@ -83,6 +90,11 @@ public class TestSCMPipelineManager {
     // new pipeline manager should be able to load the pipelines from the db
     pipelineManager =
         new SCMPipelineManager(conf, nodeManager, new EventQueue());
+    mockRatisProvider =
+        new MockRatisPipelineProvider(nodeManager,
+            pipelineManager.getStateManager(), conf);
+    pipelineManager.setPipelineProvider(HddsProtos.ReplicationType.RATIS,
+        mockRatisProvider);
     for (Pipeline p : pipelines) {
       pipelineManager.openPipeline(p.getId());
     }
@@ -100,8 +112,14 @@ public class TestSCMPipelineManager {
 
   @Test
   public void testRemovePipeline() throws IOException {
-    PipelineManager pipelineManager =
+    SCMPipelineManager pipelineManager =
         new SCMPipelineManager(conf, nodeManager, new EventQueue());
+    PipelineProvider mockRatisProvider =
+        new MockRatisPipelineProvider(nodeManager,
+            pipelineManager.getStateManager(), conf);
+    pipelineManager.setPipelineProvider(HddsProtos.ReplicationType.RATIS,
+        mockRatisProvider);
+
     Pipeline pipeline = pipelineManager
         .createPipeline(HddsProtos.ReplicationType.RATIS,
             HddsProtos.ReplicationFactor.THREE);
@@ -131,8 +149,18 @@ public class TestSCMPipelineManager {
 
   @Test
   public void testPipelineReport() throws IOException {
-    PipelineManager pipelineManager =
-        new SCMPipelineManager(conf, nodeManager, new EventQueue());
+    EventQueue eventQueue = new EventQueue();
+    SCMPipelineManager pipelineManager =
+        new SCMPipelineManager(conf, nodeManager, eventQueue);
+    PipelineProvider mockRatisProvider =
+        new MockRatisPipelineProvider(nodeManager,
+            pipelineManager.getStateManager(), conf);
+    pipelineManager.setPipelineProvider(HddsProtos.ReplicationType.RATIS,
+        mockRatisProvider);
+
+    SCMChillModeManager scmChillModeManager =
+        new SCMChillModeManager(new OzoneConfiguration(),
+            new ArrayList<>(), pipelineManager, eventQueue);
 
     // create a pipeline in allocated state with no dns yet reported
     Pipeline pipeline = pipelineManager
@@ -145,7 +173,7 @@ public class TestSCMPipelineManager {
 
     // get pipeline report from each dn in the pipeline
     PipelineReportHandler pipelineReportHandler =
-        new PipelineReportHandler(pipelineManager, conf);
+        new PipelineReportHandler(scmChillModeManager, pipelineManager, conf);
     for (DatanodeDetails dn: pipeline.getNodes()) {
       PipelineReportFromDatanode pipelineReportFromDatanode =
           TestUtils.getPipelineReportFromDatanode(dn, pipeline.getId());

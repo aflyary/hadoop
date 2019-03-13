@@ -27,9 +27,7 @@ import org.apache.hadoop.hdds.HddsConfigKeys;
 import org.apache.hadoop.hdds.scm.container.ContainerInfo;
 import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.pipeline.PipelineManager;
-import org.apache.hadoop.hdds.scm.server.SCMDatanodeProtocolServer
-    .NodeRegistrationContainerReport;
-import org.apache.hadoop.hdds.server.events.EventHandler;
+import org.apache.hadoop.hdds.scm.pipeline.RatisPipelineUtils;
 import org.apache.hadoop.hdds.server.events.EventPublisher;
 import org.apache.hadoop.hdds.server.events.EventQueue;
 import org.slf4j.Logger;
@@ -47,8 +45,7 @@ import org.slf4j.LoggerFactory;
  * for reported containers and validates if cutoff threshold for
  * containers is meet.
  */
-public class SCMChillModeManager implements
-    EventHandler<NodeRegistrationContainerReport> {
+public class SCMChillModeManager {
 
   private static final Logger LOG =
       LoggerFactory.getLogger(SCMChillModeManager.class);
@@ -59,31 +56,50 @@ public class SCMChillModeManager implements
   private Configuration config;
   private static final String CONT_EXIT_RULE = "ContainerChillModeRule";
   private static final String DN_EXIT_RULE = "DataNodeChillModeRule";
-  private static final String PIPELINE_EXIT_RULE = "PipelineChillModeRule";
+  private static final String HEALTHY_PIPELINE_EXIT_RULE =
+      "HealthyPipelineChillModeRule";
+  private static final String ATLEAST_ONE_DATANODE_REPORTED_PIPELINE_EXIT_RULE =
+      "AtleastOneDatanodeReportedRule";
 
   private final EventQueue eventPublisher;
+  private final PipelineManager pipelineManager;
 
   public SCMChillModeManager(Configuration conf,
       List<ContainerInfo> allContainers, PipelineManager pipelineManager,
       EventQueue eventQueue) {
     this.config = conf;
+    this.pipelineManager = pipelineManager;
     this.eventPublisher = eventQueue;
     this.isChillModeEnabled = conf.getBoolean(
         HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED,
         HddsConfigKeys.HDDS_SCM_CHILLMODE_ENABLED_DEFAULT);
+
     if (isChillModeEnabled) {
-      exitRules.put(CONT_EXIT_RULE,
-          new ContainerChillModeRule(config, allContainers, this));
-      exitRules.put(DN_EXIT_RULE, new DataNodeChillModeRule(config, this));
+      ContainerChillModeRule containerChillModeRule =
+          new ContainerChillModeRule(config, allContainers, this);
+      DataNodeChillModeRule dataNodeChillModeRule =
+          new DataNodeChillModeRule(config, this);
+      exitRules.put(CONT_EXIT_RULE, containerChillModeRule);
+      exitRules.put(DN_EXIT_RULE, dataNodeChillModeRule);
+      eventPublisher.addHandler(SCMEvents.NODE_REGISTRATION_CONT_REPORT,
+          containerChillModeRule);
+      eventPublisher.addHandler(SCMEvents.NODE_REGISTRATION_CONT_REPORT,
+          dataNodeChillModeRule);
 
       if (conf.getBoolean(
           HddsConfigKeys.HDDS_SCM_CHILLMODE_PIPELINE_AVAILABILITY_CHECK,
           HddsConfigKeys.HDDS_SCM_CHILLMODE_PIPELINE_AVAILABILITY_CHECK_DEFAULT)
           && pipelineManager != null) {
-        PipelineChillModeRule rule = new PipelineChillModeRule(pipelineManager,
-            this);
-        exitRules.put(PIPELINE_EXIT_RULE, rule);
-        eventPublisher.addHandler(SCMEvents.PIPELINE_REPORT, rule);
+        HealthyPipelineChillModeRule rule = new HealthyPipelineChillModeRule(
+            pipelineManager, this, config);
+        OneReplicaPipelineChillModeRule oneReplicaPipelineChillModeRule =
+            new OneReplicaPipelineChillModeRule(pipelineManager, this, conf);
+        exitRules.put(HEALTHY_PIPELINE_EXIT_RULE, rule);
+        exitRules.put(ATLEAST_ONE_DATANODE_REPORTED_PIPELINE_EXIT_RULE,
+            oneReplicaPipelineChillModeRule);
+        eventPublisher.addHandler(SCMEvents.PROCESSED_PIPELINE_REPORT, rule);
+        eventPublisher.addHandler(SCMEvents.PROCESSED_PIPELINE_REPORT,
+            oneReplicaPipelineChillModeRule);
       }
       emitChillModeStatus();
     } else {
@@ -96,7 +112,8 @@ public class SCMChillModeManager implements
    */
   @VisibleForTesting
   public void emitChillModeStatus() {
-    eventPublisher.fireEvent(SCMEvents.CHILL_MODE_STATUS, getInChillMode());
+    eventPublisher.fireEvent(SCMEvents.CHILL_MODE_STATUS,
+        new ChillModeStatus(getInChillMode()));
   }
 
   public void validateChillModeExitRules(EventPublisher eventQueue) {
@@ -128,17 +145,10 @@ public class SCMChillModeManager implements
       e.cleanup();
     }
     emitChillModeStatus();
-  }
-
-  @Override
-  public void onMessage(
-      NodeRegistrationContainerReport nodeRegistrationContainerReport,
-      EventPublisher publisher) {
-    if (getInChillMode()) {
-      exitRules.get(CONT_EXIT_RULE).process(nodeRegistrationContainerReport);
-      exitRules.get(DN_EXIT_RULE).process(nodeRegistrationContainerReport);
-      validateChillModeExitRules(publisher);
-    }
+    // TODO: #CLUTIL if we reenter chill mode the fixed interval pipeline
+    // creation job needs to stop
+    RatisPipelineUtils
+        .scheduleFixedIntervalPipelineCreator(pipelineManager, config);
   }
 
   public boolean getInChillMode() {
@@ -163,6 +173,34 @@ public class SCMChillModeManager implements
   public double getCurrentContainerThreshold() {
     return ((ContainerChillModeRule) exitRules.get(CONT_EXIT_RULE))
         .getCurrentContainerThreshold();
+  }
+
+  @VisibleForTesting
+  public HealthyPipelineChillModeRule getHealthyPipelineChillModeRule() {
+    return (HealthyPipelineChillModeRule)
+        exitRules.get(HEALTHY_PIPELINE_EXIT_RULE);
+  }
+
+  @VisibleForTesting
+  public OneReplicaPipelineChillModeRule getOneReplicaPipelineChillModeRule() {
+    return (OneReplicaPipelineChillModeRule)
+        exitRules.get(ATLEAST_ONE_DATANODE_REPORTED_PIPELINE_EXIT_RULE);
+  }
+
+
+  /**
+   * Class used during ChillMode status event.
+   */
+  public static class ChillModeStatus {
+
+    private boolean chillModeStatus;
+    public ChillModeStatus(boolean chillModeState) {
+      this.chillModeStatus = chillModeState;
+    }
+
+    public boolean getChillModeStatus() {
+      return chillModeStatus;
+    }
   }
 
 }

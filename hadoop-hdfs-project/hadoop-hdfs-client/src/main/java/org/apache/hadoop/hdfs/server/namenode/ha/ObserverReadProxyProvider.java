@@ -88,17 +88,25 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
   private boolean observerReadEnabled;
 
   /**
+   * A client using an ObserverReadProxyProvider should first sync with the
+   * active NameNode on startup. This ensures that the client reads data which
+   * is consistent with the state of the world as of the time of its
+   * instantiation. This variable will be true after this initial sync has
+   * been performed.
+   */
+  private volatile boolean msynced = false;
+
+  /**
    * The index into the nameNodeProxies list currently being used. Should only
    * be accessed in synchronized methods.
    */
   private int currentIndex = -1;
+
   /**
-   * The proxy being used currently; this will match with currentIndex above.
-   * This field is volatile to allow reads without synchronization; updates
-   * should still be performed synchronously to maintain consistency between
-   * currentIndex and this field.
+   * The proxy being used currently. Should only be accessed in synchronized
+   * methods.
    */
-  private volatile NNProxyInfo<T> currentProxy;
+  private NNProxyInfo<T> currentProxy;
 
   /** The last proxy that has been used. Only used for testing. */
   private volatile ProxyInfo<T> lastProxy = null;
@@ -120,7 +128,7 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
     super(conf, uri, xface, factory);
     this.failoverProxy = failoverProxy;
     this.alignmentContext = new ClientGSIContext();
-    ((ClientHAProxyFactory<T>) factory).setAlignmentContext(alignmentContext);
+    factory.setAlignmentContext(alignmentContext);
 
     // Don't bother configuring the number of retries and such on the retry
     // policy since it is mainly only used for determining whether or not an
@@ -191,10 +199,7 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
    * {@link #changeProxy(NNProxyInfo)} to initialize one.
    */
   private NNProxyInfo<T> getCurrentProxy() {
-    if (currentProxy == null) {
-      changeProxy(null);
-    }
-    return currentProxy;
+    return changeProxy(null);
   }
 
   /**
@@ -205,15 +210,13 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
    * returning.
    *
    * @param initial The expected current proxy
+   * @return The new proxy that should be used.
    */
-  private synchronized void changeProxy(NNProxyInfo<T> initial) {
+  private synchronized NNProxyInfo<T> changeProxy(NNProxyInfo<T> initial) {
     if (currentProxy != initial) {
       // Must have been a concurrent modification; ignore the move request
-      return;
+      return currentProxy;
     }
-    // Attempt to force concurrent callers of getCurrentProxy to wait for the
-    // new proxy; best-effort by setting currentProxy to null
-    currentProxy = null;
     currentIndex = (currentIndex + 1) % nameNodeProxies.size();
     currentProxy = createProxyIfNeeded(nameNodeProxies.get(currentIndex));
     try {
@@ -227,6 +230,23 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
     LOG.debug("Changed current proxy from {} to {}",
         initial == null ? "none" : initial.proxyInfo,
         currentProxy.proxyInfo);
+    return currentProxy;
+  }
+
+  /**
+   * This will call {@link ClientProtocol#msync()} on the active NameNode
+   * (via the {@link #failoverProxy}) to initialize the state of this client.
+   * Calling it multiple times is a no-op; only the first will perform an
+   * msync.
+   *
+   * @see #msynced
+   */
+  private synchronized void initializeMsync() throws IOException {
+    if (msynced) {
+      return; // No need for an msync
+    }
+    failoverProxy.getProxy().proxy.msync();
+    msynced = true;
   }
 
   /**
@@ -249,6 +269,12 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
       Object retVal;
 
       if (observerReadEnabled && isRead(method)) {
+        if (!msynced) {
+          // An msync() must first be performed to ensure that this client is
+          // up-to-date with the active's state. This will only be done once.
+          initializeMsync();
+        }
+
         int failedObserverCount = 0;
         int activeCount = 0;
         int standbyCount = 0;
@@ -320,6 +346,9 @@ public class ObserverReadProxyProvider<T extends ClientProtocol>
         // This exception will be handled by higher layers
         throw e.getCause();
       }
+      // If this was reached, the request reached the active, so the
+      // state is up-to-date with active and no further msync is needed.
+      msynced = true;
       lastProxy = activeProxy;
       return retVal;
     }

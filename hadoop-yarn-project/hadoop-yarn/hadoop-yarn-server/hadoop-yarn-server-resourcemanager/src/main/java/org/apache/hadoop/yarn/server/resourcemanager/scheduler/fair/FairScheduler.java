@@ -21,8 +21,9 @@ package org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import com.google.common.util.concurrent.SettableFuture;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.classification.InterfaceAudience.LimitedPrivate;
 import org.apache.hadoop.classification.InterfaceStability.Unstable;
 import org.apache.hadoop.conf.Configuration;
@@ -43,6 +44,7 @@ import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceOption;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
 import org.apache.hadoop.yarn.api.records.SchedulingRequest;
+import org.apache.hadoop.yarn.api.records.Priority;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions
         .SchedulerInvalidResoureRequestException;
@@ -145,9 +147,10 @@ public class FairScheduler extends
   private QueueManager queueMgr;
   private boolean usePortForNodeName;
 
-  private static final Log LOG = LogFactory.getLog(FairScheduler.class);
-  private static final Log STATE_DUMP_LOG =
-      LogFactory.getLog(FairScheduler.class.getName() + ".statedump");
+  private static final Logger LOG =
+      LoggerFactory.getLogger(FairScheduler.class);
+  private static final Logger STATE_DUMP_LOG =
+      LoggerFactory.getLogger(FairScheduler.class.getName() + ".statedump");
 
   private static final ResourceCalculator RESOURCE_CALCULATOR =
       new DefaultResourceCalculator();
@@ -2008,5 +2011,14 @@ public class FairScheduler extends
   public long checkAndGetApplicationLifetime(String queueName, long lifetime) {
     // Lifetime is the application lifetime by default.
     return lifetime;
+  }
+
+  @Override
+  public Priority updateApplicationPriority(Priority newPriority,
+      ApplicationId applicationId, SettableFuture<Object> future,
+      UserGroupInformation user)
+      throws YarnException {
+    throw new YarnException(
+        "Update application priority is not supported in Fair Scheduler");
   }
 }

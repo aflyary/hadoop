@@ -1,3 +1,4 @@
+
 /**
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with this
@@ -36,6 +37,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import io.opentracing.Scope;
+import io.opentracing.util.GlobalTracer;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.hadoop.hdds.cli.HddsVersionProvider;
 import org.apache.hadoop.hdds.client.OzoneQuota;
@@ -211,6 +215,9 @@ public final class RandomKeyGenerator implements Callable<Void> {
     for (FreonOps ops : FreonOps.values()) {
       histograms.add(ops.ordinal(), new Histogram(new UniformReservoir()));
     }
+    if (freon != null) {
+      freon.startHttpServer();
+    }
   }
 
   @Override
@@ -289,7 +296,12 @@ public final class RandomKeyGenerator implements Callable<Void> {
    */
   private void addShutdownHook() {
     Runtime.getRuntime().addShutdownHook(
-        new Thread(() -> printStats(System.out)));
+        new Thread(() -> {
+          printStats(System.out);
+          if (freon != null) {
+            freon.stopHttpServer();
+          }
+        }));
   }
   /**
    * Prints stats of {@link Freon} run to the PrintStream.
@@ -550,11 +562,13 @@ public final class RandomKeyGenerator implements Callable<Void> {
     }
 
     @Override
+    @SuppressFBWarnings("REC_CATCH_EXCEPTION")
     public void run() {
       LOG.trace("Creating volume: {}", volumeName);
       long start = System.nanoTime();
       OzoneVolume volume;
-      try {
+      try (Scope scope = GlobalTracer.get().buildSpan("createVolume")
+          .startActive(true)) {
         objectStore.createVolume(volumeName);
         long volumeCreationDuration = System.nanoTime() - start;
         volumeCreationTime.getAndAdd(volumeCreationDuration);
@@ -576,12 +590,15 @@ public final class RandomKeyGenerator implements Callable<Void> {
           LOG.trace("Creating bucket: {} in volume: {}",
               bucketName, volume.getName());
           start = System.nanoTime();
-          volume.createBucket(bucketName);
-          long bucketCreationDuration = System.nanoTime() - start;
-          histograms.get(FreonOps.BUCKET_CREATE.ordinal())
-              .update(bucketCreationDuration);
-          bucketCreationTime.getAndAdd(bucketCreationDuration);
-          numberOfBucketsCreated.getAndIncrement();
+          try (Scope scope = GlobalTracer.get().buildSpan("createBucket")
+              .startActive(true)) {
+            volume.createBucket(bucketName);
+            long bucketCreationDuration = System.nanoTime() - start;
+            histograms.get(FreonOps.BUCKET_CREATE.ordinal())
+                .update(bucketCreationDuration);
+            bucketCreationTime.getAndAdd(bucketCreationDuration);
+            numberOfBucketsCreated.getAndIncrement();
+          }
           OzoneBucket bucket = volume.getBucket(bucketName);
           for (int k = 0; k < totalKeys; k++) {
             String key = "key-" + k + "-" +
@@ -592,22 +609,32 @@ public final class RandomKeyGenerator implements Callable<Void> {
               LOG.trace("Adding key: {} in bucket: {} of volume: {}",
                   key, bucket, volume);
               long keyCreateStart = System.nanoTime();
-              OzoneOutputStream os =
-                  bucket.createKey(key, keySize, type, factor, new HashMap<>());
-              long keyCreationDuration = System.nanoTime() - keyCreateStart;
-              histograms.get(FreonOps.KEY_CREATE.ordinal())
-                  .update(keyCreationDuration);
-              keyCreationTime.getAndAdd(keyCreationDuration);
-              long keyWriteStart = System.nanoTime();
-              os.write(keyValue);
-              os.write(randomValue);
-              os.close();
-              long keyWriteDuration = System.nanoTime() - keyWriteStart;
-              threadKeyWriteTime += keyWriteDuration;
-              histograms.get(FreonOps.KEY_WRITE.ordinal())
-                  .update(keyWriteDuration);
-              totalBytesWritten.getAndAdd(keySize);
-              numberOfKeysAdded.getAndIncrement();
+              try (Scope scope = GlobalTracer.get().buildSpan("createKey")
+                  .startActive(true)) {
+                OzoneOutputStream os =
+                    bucket
+                        .createKey(key, keySize, type, factor, new HashMap<>());
+                long keyCreationDuration = System.nanoTime() - keyCreateStart;
+                histograms.get(FreonOps.KEY_CREATE.ordinal())
+                    .update(keyCreationDuration);
+                keyCreationTime.getAndAdd(keyCreationDuration);
+                long keyWriteStart = System.nanoTime();
+                try (Scope writeScope = GlobalTracer.get()
+                    .buildSpan("writeKeyData")
+                    .startActive(true)) {
+                  os.write(keyValue);
+                  os.write(randomValue);
+                  os.close();
+                }
+
+                long keyWriteDuration = System.nanoTime() - keyWriteStart;
+
+                threadKeyWriteTime += keyWriteDuration;
+                histograms.get(FreonOps.KEY_WRITE.ordinal())
+                    .update(keyWriteDuration);
+                totalBytesWritten.getAndAdd(keySize);
+                numberOfKeysAdded.getAndIncrement();
+              }
               if (validateWrites) {
                 byte[] value = ArrayUtils.addAll(keyValue, randomValue);
                 boolean validate = validationQueue.offer(

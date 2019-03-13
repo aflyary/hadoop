@@ -1226,6 +1226,16 @@ public class YarnConfiguration extends Configuration {
   public static final String DEFAULT_NM_COLLECTOR_SERVICE_ADDRESS =
       "0.0.0.0:" + DEFAULT_NM_COLLECTOR_SERVICE_PORT;
 
+  /**
+   * The setting that controls whether yarn container events are published to
+   * the timeline service or not by NM. This configuration setting is for ATS
+   * V2
+   */
+  public static final String NM_PUBLISH_CONTAINER_EVENTS_ENABLED = NM_PREFIX
+      + "emit-container-events";
+  public static final boolean DEFAULT_NM_PUBLISH_CONTAINER_EVENTS_ENABLED =
+      true;
+
   /** Interval in between cache cleanups.*/
   public static final String NM_LOCALIZER_CACHE_CLEANUP_INTERVAL_MS =
     NM_PREFIX + "localizer.cache.cleanup.interval-ms";
@@ -1649,9 +1659,6 @@ public class YarnConfiguration extends Configuration {
   public static final String NM_GPU_PATH_TO_EXEC =
       NM_GPU_RESOURCE_PREFIX + "path-to-discovery-executables";
 
-  @Private
-  public static final String DEFAULT_NM_GPU_PATH_TO_EXEC = "";
-
   /**
    * Settings to control which implementation of docker plugin for GPU will be
    * used.
@@ -1707,6 +1714,15 @@ public class YarnConfiguration extends Configuration {
   @Private
   public static final String DEFAULT_NM_FPGA_VENDOR_PLUGIN =
       "org.apache.hadoop.yarn.server.nodemanager.containermanager.resourceplugin.fpga.IntelFpgaOpenclPlugin";
+
+  @Private
+  public static final String NM_FPGA_DEVICE_DISCOVERY_SCRIPT =
+      NM_FPGA_RESOURCE_PREFIX + "device-discovery-script";
+
+  @Private
+  public static final String NM_FPGA_AVAILABLE_DEVICES =
+      NM_FPGA_RESOURCE_PREFIX + "available-devices";
+
 
   public static final String NM_NETWORK_TAG_PREFIX = NM_PREFIX
       + "network-tagging";
@@ -1925,6 +1941,10 @@ public class YarnConfiguration extends Configuration {
   /** Default docker image to be used. */
   public static final String NM_DOCKER_IMAGE_NAME =
       DOCKER_CONTAINER_RUNTIME_PREFIX + "image-name";
+
+  /** Default option to decide whether to pull the latest image or not. **/
+  public static final String NM_DOCKER_IMAGE_UPDATE =
+      DOCKER_CONTAINER_RUNTIME_PREFIX + "image-update";
 
   /** Capabilities allowed (and added by default) for docker containers. **/
   public static final String NM_DOCKER_CONTAINER_CAPABILITIES =
@@ -2767,6 +2787,19 @@ public class YarnConfiguration extends Configuration {
   /** default hdfs location for flowrun coprocessor jar. */
   public static final String DEFAULT_HDFS_LOCATION_FLOW_RUN_COPROCESSOR_JAR =
       "/hbase/coprocessor/hadoop-yarn-server-timelineservice.jar";
+
+  /**
+   * This setting controls the max size of the flow name getting generated
+   * in ATSv2 after removing UUID if present.
+   * */
+  public static final String FLOW_NAME_MAX_SIZE =
+      TIMELINE_SERVICE_PREFIX + "flowname.max-size";
+
+  /**
+   * Default setting for flow name size has no size restriction
+   * after removing UUID if present.
+   */
+  public static final int FLOW_NAME_DEFAULT_MAX_SIZE = 0;
 
     /**
    * The name for setting that points to an optional HBase configuration

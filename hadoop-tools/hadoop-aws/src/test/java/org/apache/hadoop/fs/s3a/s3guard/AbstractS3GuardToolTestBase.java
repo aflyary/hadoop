@@ -24,10 +24,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.PrintStream;
 import java.net.URI;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -37,7 +38,6 @@ import org.apache.hadoop.fs.s3a.S3AUtils;
 import org.apache.hadoop.util.StopWatch;
 import com.google.common.base.Preconditions;
 import org.apache.hadoop.fs.FileSystem;
-import org.junit.Assume;
 import org.junit.Test;
 
 import org.apache.hadoop.conf.Configuration;
@@ -61,9 +61,8 @@ import static org.apache.hadoop.fs.s3a.Constants.S3GUARD_METASTORE_NULL;
 import static org.apache.hadoop.fs.s3a.Constants.S3_METADATA_STORE_IMPL;
 import static org.apache.hadoop.fs.s3a.S3AUtils.clearBucketOption;
 import static org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.E_BAD_STATE;
-import static org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.E_NO_METASTORE_OR_FILESYSTEM;
-import static org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.E_USAGE;
 import static org.apache.hadoop.fs.s3a.s3guard.S3GuardTool.SUCCESS;
+import static org.apache.hadoop.fs.s3a.s3guard.S3GuardToolTestHelper.exec;
 import static org.apache.hadoop.test.LambdaTestUtils.intercept;
 
 /**
@@ -88,11 +87,21 @@ public abstract class AbstractS3GuardToolTestBase extends AbstractS3ATestBase {
     assertEquals(message, expected, tool.run(args));
   }
 
-  protected static void expectSuccess(
+  /**
+   * Expect a command to succeed.
+   * @param message any extra text to include in the assertion error message
+   * @param tool tool to run
+   * @param args arguments to the command
+   * @return the output of any successful run
+   * @throws Exception failure
+   */
+  protected static String expectSuccess(
       String message,
       S3GuardTool tool,
       String... args) throws Exception {
-    assertEquals(message, SUCCESS, tool.run(args));
+    ByteArrayOutputStream buf = new ByteArrayOutputStream();
+    exec(SUCCESS, message, tool, buf, args);
+    return buf.toString();
   }
 
   /**
@@ -361,47 +370,74 @@ public abstract class AbstractS3GuardToolTestBase extends AbstractS3ATestBase {
    * Binds the configuration to a nonexistent table.
    * @param conf
    */
-  protected void bindToNonexistentTable(final Configuration conf) {
+  private void bindToNonexistentTable(final Configuration conf) {
     conf.set(S3GUARD_DDB_TABLE_NAME_KEY, UUID.randomUUID().toString());
+    conf.unset(S3GUARD_DDB_REGION_KEY);
     conf.setBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, false);
   }
 
-  @Test
-  public void testDestroyNoBucket() throws Throwable {
-    describe("Destroy a bucket which doesn't exist");
-
+  /**
+   * Make an S3GuardTool of the specific subtype with binded configuration
+   * to a nonexistent table.
+   * @param tool
+   */
+  private S3GuardTool makeBindedTool(Class<? extends S3GuardTool> tool)
+      throws Exception {
     Configuration conf = getConfiguration();
     // set a table as a safety check in case the test goes wrong
     // and deletes it.
     bindToNonexistentTable(conf);
-
-    S3GuardTool.Destroy cmdR = new S3GuardTool.Destroy(conf);
-    String[] argsR = new String[]{
-        S3GuardTool.Destroy.NAME,
-        S3A_THIS_BUCKET_DOES_NOT_EXIST
-    };
-    intercept(FileNotFoundException.class,
-        () -> cmdR.run(argsR));
+    return tool.getDeclaredConstructor(Configuration.class).newInstance(conf);
   }
 
   @Test
-  public void testDestroyNoArgs() throws Throwable {
-    describe("Destroy a bucket which doesn't exist");
+  public void testToolsNoBucket() throws Throwable {
+    List<Class<? extends S3GuardTool>> tools =
+        Arrays.asList(S3GuardTool.Destroy.class, S3GuardTool.BucketInfo.class,
+            S3GuardTool.Diff.class, S3GuardTool.Import.class,
+            S3GuardTool.Prune.class, S3GuardTool.SetCapacity.class,
+            S3GuardTool.Uploads.class);
 
-    Configuration conf = getConfiguration();
-    // set a table as a safety check in case the test goes wrong
-    // and deletes it.
-    conf.set(S3GUARD_DDB_TABLE_NAME_KEY, UUID.randomUUID().toString());
-    conf.set(S3GUARD_DDB_REGION_KEY, "us-gov-west-1");
-    conf.setBoolean(S3GUARD_DDB_TABLE_CREATE_KEY, false);
+    for (Class<? extends S3GuardTool> tool : tools) {
+      S3GuardTool cmdR = makeBindedTool(tool);
+      describe("Calling " + cmdR.getName() + " on a bucket that does not exist.");
+      String[] argsR = new String[]{
+          cmdR.getName(),
+          S3A_THIS_BUCKET_DOES_NOT_EXIST
+      };
+      intercept(FileNotFoundException.class,
+          () -> cmdR.run(argsR));
+    }
+  }
 
-    S3GuardTool.Destroy cmdR = new S3GuardTool.Destroy(conf);
+  @Test
+  public void testToolsNoArgsForBucketAndDDBTable() throws Throwable {
+    List<Class<? extends S3GuardTool>> tools =
+        Arrays.asList(S3GuardTool.Destroy.class, S3GuardTool.Init.class);
 
-    assertExitCode(E_USAGE,
-        intercept(ExitUtil.ExitException.class,
-            E_NO_METASTORE_OR_FILESYSTEM,
-            () -> cmdR.run(new String[]{})));
+    for (Class<? extends S3GuardTool> tool : tools) {
+      S3GuardTool cmdR = makeBindedTool(tool);
+      describe("Calling " + cmdR.getName() + " without any arguments.");
+      intercept(ExitUtil.ExitException.class,
+          "S3 bucket url or DDB table name have to be provided explicitly",
+          () -> cmdR.run(new String[]{tool.getName()}));
+    }
+  }
 
+  @Test
+  public void testToolsNoArgsForBucket() throws Throwable {
+    List<Class<? extends S3GuardTool>> tools =
+        Arrays.asList(S3GuardTool.BucketInfo.class, S3GuardTool.Diff.class,
+            S3GuardTool.Import.class, S3GuardTool.Prune.class,
+            S3GuardTool.SetCapacity.class, S3GuardTool.Uploads.class);
+
+    for (Class<? extends S3GuardTool> tool : tools) {
+      S3GuardTool cmdR = makeBindedTool(tool);
+      describe("Calling " + cmdR.getName() + " without any arguments.");
+      assertExitCode(S3GuardTool.INVALID_ARGUMENT,
+          intercept(ExitUtil.ExitException.class,
+              () -> cmdR.run(new String[]{tool.getName()})));
+    }
   }
 
   @Test
@@ -431,9 +467,8 @@ public abstract class AbstractS3GuardToolTestBase extends AbstractS3ATestBase {
   protected void assertExitCode(final int expectedErrorCode,
       final ExitUtil.ExitException e) {
     if (e.getExitCode() != expectedErrorCode) {
-      throw new AssertionError("Expected error code " + expectedErrorCode
-          + " in " + e,
-          e);
+      throw new AssertionError("Expected error code " +
+          expectedErrorCode + " in " + e, e);
     }
   }
 
@@ -448,58 +483,6 @@ public abstract class AbstractS3GuardToolTestBase extends AbstractS3ATestBase {
   public void testInitFailsIfNoBucketNameOrDDBTableSet() throws Exception {
     intercept(ExitUtil.ExitException.class,
         () -> run(S3GuardTool.Init.NAME));
-  }
-
-  /**
-   * Get the test CSV file; assume() that it is not modified (i.e. we haven't
-   * switched to a new storage infrastructure where the bucket is no longer
-   * read only).
-   * @return test file.
-   */
-  protected String getLandsatCSVFile() {
-    String csvFile = getConfiguration()
-        .getTrimmed(KEY_CSVTEST_FILE, DEFAULT_CSVTEST_FILE);
-    Assume.assumeTrue("CSV test file is not the default",
-        DEFAULT_CSVTEST_FILE.equals(csvFile));
-    return csvFile;
-  }
-
-  /**
-   * Execute a command, returning the buffer if the command actually completes.
-   * If an exception is raised the output is logged instead.
-   * @param cmd command
-   * @param args argument list
-   * @throws Exception on any failure
-   */
-  public String exec(S3GuardTool cmd, String...args) throws Exception {
-    ByteArrayOutputStream buf = new ByteArrayOutputStream();
-    try {
-      exec(cmd, buf, args);
-      return buf.toString();
-    } catch (AssertionError e) {
-      throw e;
-    } catch (Exception e) {
-      LOG.error("Command {} failed: \n{}", cmd, buf);
-      throw e;
-    }
-  }
-
-  /**
-   * Execute a command, saving the output into the buffer.
-   * @param cmd command
-   * @param buf buffer to use for tool output (not SLF4J output)
-   * @param args argument list
-   * @throws Exception on any failure
-   */
-  protected void exec(S3GuardTool cmd, ByteArrayOutputStream buf, String...args)
-      throws Exception {
-    LOG.info("exec {}", (Object) args);
-    int r = 0;
-    try(PrintStream out =new PrintStream(buf)) {
-      r = cmd.run(args, out);
-      out.flush();
-    }
-    assertEquals("Command " + cmd + " failed\n"+ buf, 0, r);
   }
 
   @Test
@@ -537,7 +520,7 @@ public abstract class AbstractS3GuardToolTestBase extends AbstractS3ATestBase {
     ByteArrayOutputStream buf = new ByteArrayOutputStream();
     S3GuardTool.Diff cmd = new S3GuardTool.Diff(fs.getConf());
     cmd.setStore(ms);
-    exec(cmd, buf, "diff", "-meta", DYNAMODB_TABLE, testPath.toString());
+    exec(0, "", cmd, buf, "diff", "-meta", DYNAMODB_TABLE, testPath.toString());
 
     Set<Path> actualOnS3 = new HashSet<>();
     Set<Path> actualOnMS = new HashSet<>();

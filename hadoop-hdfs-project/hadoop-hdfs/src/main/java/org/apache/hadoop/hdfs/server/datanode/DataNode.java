@@ -166,6 +166,7 @@ import org.apache.hadoop.hdfs.server.datanode.SecureDataNodeStarter.SecureResour
 import org.apache.hadoop.hdfs.server.datanode.erasurecode.ErasureCodingWorker;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeSpi;
+import org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.AddBlockPoolException;
 import org.apache.hadoop.hdfs.server.datanode.metrics.DataNodeDiskMetrics;
 import org.apache.hadoop.hdfs.server.datanode.metrics.DataNodeMetrics;
 import org.apache.hadoop.hdfs.server.datanode.metrics.DataNodePeerMetrics;
@@ -581,7 +582,15 @@ public class DataNode extends ReconfigurableBase
                       "balancer max concurrent movers must be larger than 0"));
             }
           }
-          xserver.updateBalancerMaxConcurrentMovers(movers);
+          boolean success = xserver.updateBalancerMaxConcurrentMovers(movers);
+          if (!success) {
+            rootException = new ReconfigurationException(
+                property,
+                newVal,
+                getConf().get(property),
+                new IllegalArgumentException(
+                    "Could not modify concurrent moves thread count"));
+          }
           return Integer.toString(movers);
         } catch (NumberFormatException nfe) {
           rootException = new ReconfigurationException(
@@ -1681,11 +1690,35 @@ public class DataNode extends ReconfigurableBase
     // Exclude failed disks before initializing the block pools to avoid startup
     // failures.
     checkDiskError();
-
-    data.addBlockPool(nsInfo.getBlockPoolID(), getConf());
+    try {
+      data.addBlockPool(nsInfo.getBlockPoolID(), getConf());
+    } catch (AddBlockPoolException e) {
+      handleAddBlockPoolError(e);
+    }
     blockScanner.enableBlockPoolId(bpos.getBlockPoolId());
     initDirectoryScanner(getConf());
     initDiskBalancer(data, getConf());
+  }
+
+  /**
+   * Handles an AddBlockPoolException object thrown from
+   * {@link org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeList#
+   * addBlockPool}. Will ensure that all volumes that encounted a
+   * AddBlockPoolException are removed from the DataNode and marked as failed
+   * volumes in the same way as a runtime volume failure.
+   *
+   * @param e this exception is a container for all IOException objects caught
+   *          in FsVolumeList#addBlockPool.
+   */
+  private void handleAddBlockPoolError(AddBlockPoolException e)
+      throws IOException {
+    Map<FsVolumeSpi, IOException> unhealthyDataDirs =
+        e.getFailingVolumes();
+    if (unhealthyDataDirs != null && !unhealthyDataDirs.isEmpty()) {
+      handleVolumeFailures(unhealthyDataDirs.keySet());
+    } else {
+      LOG.debug("HandleAddBlockPoolError called with empty exception list");
+    }
   }
 
   List<BPOfferService> getAllBpOs() {

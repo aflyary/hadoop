@@ -33,6 +33,7 @@ import org.apache.hadoop.hdds.scm.container.common.helpers
     .InvalidContainerStateException;
 import org.apache.hadoop.hdds.scm.container.common.helpers
     .StorageContainerException;
+import org.apache.hadoop.hdds.tracing.TracingUtil;
 import org.apache.hadoop.ozone.audit.AuditAction;
 import org.apache.hadoop.ozone.audit.AuditEventStatus;
 import org.apache.hadoop.ozone.audit.AuditLogger;
@@ -61,11 +62,14 @@ import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.
     ContainerDataProto.State;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.Result;
 import org.apache.hadoop.ozone.container.common.interfaces.ContainerDispatcher;
+
+import io.opentracing.Scope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Ozone Container dispatcher takes a call from the netty server and routes it
@@ -101,7 +105,6 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
     this.containerCloseThreshold = conf.getFloat(
         HddsConfigKeys.HDDS_CONTAINER_CLOSE_THRESHOLD,
         HddsConfigKeys.HDDS_CONTAINER_CLOSE_THRESHOLD_DEFAULT);
-
   }
 
   @Override
@@ -126,7 +129,6 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
     case CONTAINER_UNHEALTHY:
     case CLOSED_CONTAINER_IO:
     case DELETE_ON_OPEN_CONTAINER:
-    case ERROR_CONTAINER_NOT_EMPTY:
       return true;
     default:
       return false;
@@ -134,7 +136,22 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
   }
 
   @Override
+  public void buildMissingContainerSet(Set<Long> createdContainerSet) {
+    containerSet.buildMissingContainerSet(createdContainerSet);
+  }
+
+  @Override
   public ContainerCommandResponseProto dispatch(
+      ContainerCommandRequestProto msg, DispatcherContext dispatcherContext) {
+    String spanName = "HddsDispatcher." + msg.getCmdType().name();
+    try (Scope scope = TracingUtil
+        .importAndCreateScope(spanName, msg.getTraceID())) {
+      return dispatchRequest(msg, dispatcherContext);
+    }
+  }
+
+  @SuppressWarnings("methodlength")
+  private ContainerCommandResponseProto dispatchRequest(
       ContainerCommandRequestProto msg, DispatcherContext dispatcherContext) {
     Preconditions.checkNotNull(msg);
     LOG.trace("Command {}, trace ID: {} ", msg.getCmdType().toString(),
@@ -146,22 +163,78 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
     Map<String, String> params =
         ContainerCommandRequestPBHelper.getAuditParams(msg);
 
-    Container container = null;
-    ContainerType containerType = null;
+    Container container;
+    ContainerType containerType;
     ContainerCommandResponseProto responseProto = null;
     long startTime = System.nanoTime();
     ContainerProtos.Type cmdType = msg.getCmdType();
     long containerID = msg.getContainerID();
     metrics.incContainerOpsMetrics(cmdType);
+    container = getContainer(containerID);
+    boolean isWriteStage =
+        (cmdType == ContainerProtos.Type.WriteChunk && dispatcherContext != null
+            && dispatcherContext.getStage()
+            == DispatcherContext.WriteChunkStage.WRITE_DATA);
+    boolean isWriteCommitStage =
+        (cmdType == ContainerProtos.Type.WriteChunk && dispatcherContext != null
+            && dispatcherContext.getStage()
+            == DispatcherContext.WriteChunkStage.COMMIT_DATA);
+
+    // if the command gets executed other than Ratis, the default wroite stage
+    // is WriteChunkStage.COMBINED
+    boolean isCombinedStage =
+        cmdType == ContainerProtos.Type.WriteChunk && (dispatcherContext == null
+            || dispatcherContext.getStage()
+            == DispatcherContext.WriteChunkStage.COMBINED);
+    Set<Long> containerIdSet = null;
+    if (dispatcherContext != null) {
+      containerIdSet = dispatcherContext.getCreateContainerSet();
+    }
+    if (isWriteCommitStage) {
+      //  check if the container Id exist in the loaded snapshot file. if
+      // it does not , it infers that , this is a restart of dn where
+      // the we are reapplying the transaction which was not captured in the
+      // snapshot.
+      // just add it to the list, and remove it from missing container set
+      // as it might have been added in the list during "init".
+      Preconditions.checkNotNull(containerIdSet);
+      if (!containerIdSet.contains(containerID)) {
+        containerIdSet.add(containerID);
+        containerSet.getMissingContainerSet().remove(containerID);
+      }
+    }
+    if (getMissingContainerSet().contains(containerID)) {
+      StorageContainerException sce = new StorageContainerException(
+          "ContainerID " + containerID
+              + " has been lost and and cannot be recreated on this DataNode",
+          ContainerProtos.Result.CONTAINER_MISSING);
+      audit(action, eventType, params, AuditEventStatus.FAILURE, sce);
+      return ContainerUtils.logAndReturnError(LOG, sce, msg);
+    }
 
     if (cmdType != ContainerProtos.Type.CreateContainer) {
-      container = getContainer(containerID);
-
-      if (container == null && (cmdType == ContainerProtos.Type.WriteChunk
+      /**
+       * Create Container should happen only as part of Write_Data phase of
+       * writeChunk.
+       */
+      if (container == null && ((isWriteStage || isCombinedStage)
           || cmdType == ContainerProtos.Type.PutSmallFile)) {
         // If container does not exist, create one for WriteChunk and
         // PutSmallFile request
-        createContainer(msg);
+        responseProto = createContainer(msg);
+        if (responseProto.getResult() != Result.SUCCESS) {
+          StorageContainerException sce = new StorageContainerException(
+              "ContainerID " + containerID + " creation failed",
+              responseProto.getResult());
+          audit(action, eventType, params, AuditEventStatus.FAILURE, sce);
+          return ContainerUtils.logAndReturnError(LOG, sce, msg);
+        }
+        Preconditions.checkArgument(isWriteStage && containerIdSet != null
+            || dispatcherContext == null);
+        if (containerIdSet != null) {
+          // adds this container to list of containers created in the pipeline
+          containerIdSet.add(containerID);
+        }
         container = getContainer(containerID);
       }
 
@@ -251,8 +324,11 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
    * Create a container using the input container request.
    * @param containerRequest - the container request which requires container
    *                         to be created.
+   * @return ContainerCommandResponseProto container command response.
    */
-  private void createContainer(ContainerCommandRequestProto containerRequest) {
+  @VisibleForTesting
+  ContainerCommandResponseProto createContainer(
+      ContainerCommandRequestProto containerRequest) {
     ContainerProtos.CreateContainerRequestProto.Builder createRequest =
         ContainerProtos.CreateContainerRequestProto.newBuilder();
     ContainerType containerType =
@@ -271,7 +347,7 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
     // TODO: Assuming the container type to be KeyValueContainer for now.
     // We need to get container type from the containerRequest.
     Handler handler = getHandler(containerType);
-    handler.handle(requestBuilder.build(), null, null);
+    return handler.handle(requestBuilder.build(), null, null);
   }
 
   /**
@@ -394,6 +470,11 @@ public class HddsDispatcher implements ContainerDispatcher, Auditor {
   @VisibleForTesting
   public Container getContainer(long containerID) {
     return containerSet.getContainer(containerID);
+  }
+
+  @VisibleForTesting
+  public Set<Long> getMissingContainerSet() {
+    return containerSet.getMissingContainerSet();
   }
 
   private ContainerType getContainerType(Container container) {

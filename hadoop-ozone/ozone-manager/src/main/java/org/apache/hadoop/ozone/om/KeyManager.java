@@ -17,6 +17,7 @@
 package org.apache.hadoop.ozone.om;
 
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
+import org.apache.hadoop.hdds.scm.container.common.helpers.ExcludeList;
 import org.apache.hadoop.ozone.common.BlockGroup;
 import org.apache.hadoop.ozone.om.helpers.OmKeyArgs;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
@@ -25,6 +26,7 @@ import org.apache.hadoop.ozone.om.helpers.OmMultipartCommitUploadPartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadCompleteInfo;
 import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadList;
+import org.apache.hadoop.ozone.om.helpers.OmMultipartUploadListParts;
 import org.apache.hadoop.ozone.om.helpers.OpenKeySession;
 import org.apache.hadoop.utils.BackgroundService;
 
@@ -66,11 +68,13 @@ public interface KeyManager {
    *
    * @param args the key to append
    * @param clientID the client requesting block.
+   * @param excludeList List of datanodes/containers to exclude during block
+   *                    allocation.
    * @return the reference to the new block.
    * @throws IOException
    */
-  OmKeyLocationInfo allocateBlock(OmKeyArgs args, long clientID)
-      throws IOException;
+  OmKeyLocationInfo allocateBlock(OmKeyArgs args, long clientID,
+      ExcludeList excludeList) throws IOException;
   /**
    * Given the args of a key to put, write an open key entry to meta data.
    *
@@ -220,4 +224,20 @@ public interface KeyManager {
    * @throws IOException
    */
   void abortMultipartUpload(OmKeyArgs omKeyArgs) throws IOException;
+
+
+  /**
+   * Returns list of parts of a multipart upload key.
+   * @param volumeName
+   * @param bucketName
+   * @param keyName
+   * @param uploadID
+   * @param partNumberMarker
+   * @param maxParts
+   * @return OmMultipartUploadListParts
+   */
+  OmMultipartUploadListParts listParts(String volumeName, String bucketName,
+      String keyName, String uploadID, int partNumberMarker,
+      int maxParts)  throws IOException;
+
 }

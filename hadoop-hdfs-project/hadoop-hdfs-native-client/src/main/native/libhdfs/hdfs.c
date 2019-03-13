@@ -1013,7 +1013,7 @@ static hdfsFile hdfsOpenFileImpl(hdfsFS fs, const char *path, int flags,
        return f{is|os};
     */
     int accmode = flags & O_ACCMODE;
-    jstring jStrBufferSize = NULL, jStrReplication = NULL;
+    jstring jStrBufferSize = NULL, jStrReplication = NULL, jCapabilityString = NULL;
     jobject jConfiguration = NULL, jPath = NULL, jFile = NULL;
     jobject jFS = (jobject)fs;
     jthrowable jthr;
@@ -1171,16 +1171,22 @@ static hdfsFile hdfsOpenFileImpl(hdfsFS fs, const char *path, int flags,
     file->flags = 0;
 
     if ((flags & O_WRONLY) == 0) {
-        // Try a test read to see if we can do direct reads
-        char buf;
-        if (readDirect(fs, file, &buf, 0) == 0) {
-            // Success - 0-byte read should return 0
+        // Check the StreamCapabilities of jFile to see if we can do direct reads
+        jthr = newJavaStr(env, "in:readbytebuffer", &jCapabilityString);
+        if (jthr) {
+            ret = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
+                                        "hdfsOpenFile(%s): newJavaStr", path);
+            goto done;
+        }
+        jthr = invokeMethod(env, &jVal, INSTANCE, jFile, HADOOP_ISTRM,
+                            "hasCapability", "(Ljava/lang/String;)Z", jCapabilityString);
+        if (jthr) {
+            ret = printExceptionAndFree(env, jthr, PRINT_EXC_ALL,
+                                        "hdfsOpenFile(%s): FSDataInputStream#hasCapability", path);
+            goto done;
+        }
+        if (jVal.z) {
             file->flags |= HDFS_FILE_SUPPORTS_DIRECT_READ;
-        } else if (errno != ENOTSUP) {
-            // Unexpected error. Clear it, don't set the direct flag.
-            fprintf(stderr,
-                  "hdfsOpenFile(%s): WARN: Unexpected error %d when testing "
-                  "for direct read compatibility\n", path, errno);
         }
     }
     ret = 0;
@@ -1190,7 +1196,8 @@ done:
     destroyLocalReference(env, jStrReplication);
     destroyLocalReference(env, jConfiguration); 
     destroyLocalReference(env, jPath); 
-    destroyLocalReference(env, jFile); 
+    destroyLocalReference(env, jFile);
+    destroyLocalReference(env, jCapabilityString);
     if (ret) {
         if (file) {
             if (file->file) {
@@ -1396,7 +1403,6 @@ tSize hdfsRead(hdfsFS fs, hdfsFile f, void* buffer, tSize length)
 {
     jobject jInputStream;
     jbyteArray jbRarray;
-    jint noReadBytes = length;
     jvalue jVal;
     jthrowable jthr;
     JNIEnv* env;
@@ -1452,7 +1458,12 @@ tSize hdfsRead(hdfsFS fs, hdfsFile f, void* buffer, tSize length)
         errno = EINTR;
         return -1;
     }
-    (*env)->GetByteArrayRegion(env, jbRarray, 0, noReadBytes, buffer);
+    // We only copy the portion of the jbRarray that was actually filled by
+    // the call to FsDataInputStream#read; #read is not guaranteed to fill the
+    // entire buffer, instead it returns the number of bytes read into the
+    // buffer; we use the return value as the input in GetByteArrayRegion to
+    // ensure don't copy more bytes than necessary
+    (*env)->GetByteArrayRegion(env, jbRarray, 0, jVal.i, buffer);
     destroyLocalReference(env, jbRarray);
     if ((*env)->ExceptionCheck(env)) {
         errno = printPendingExceptionAndFree(env, PRINT_EXC_ALL,
@@ -2504,7 +2515,7 @@ int hadoopRzOptionsSetByteBufferPool(
         // Delete any previous ByteBufferPool we had.
         (*env)->DeleteGlobalRef(env, opts->byteBufferPool);
     }
-    opts->byteBufferPool = byteBufferPool;
+    opts->byteBufferPool = (*env)->NewGlobalRef(env, byteBufferPool);
     return 0;
 }
 

@@ -37,6 +37,9 @@ import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.Time;
+
+import io.opentracing.Scope;
+import io.opentracing.util.GlobalTracer;
 import org.apache.ratis.thirdparty.io.grpc.ManagedChannel;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.netty.GrpcSslContexts;
@@ -57,6 +60,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.stream.Collectors;
 
 /**
  * A Client for the storageContainer protocol.
@@ -198,11 +202,27 @@ public class XceiverClientGrpc extends XceiverClientSpi {
   @Override
   public ContainerCommandResponseProto sendCommand(
       ContainerCommandRequestProto request) throws IOException {
-    return sendCommandWithRetry(request);
+    try {
+      XceiverClientReply reply;
+      reply = sendCommandWithRetry(request, null);
+      ContainerCommandResponseProto responseProto = reply.getResponse().get();
+      return responseProto;
+    } catch (ExecutionException | InterruptedException e) {
+      throw new IOException("Failed to execute command " + request, e);
+    }
   }
 
-  public ContainerCommandResponseProto sendCommandWithRetry(
-      ContainerCommandRequestProto request) throws IOException {
+  @Override
+  public XceiverClientReply sendCommand(
+      ContainerCommandRequestProto request, List<DatanodeDetails> excludeDns)
+      throws IOException {
+    Preconditions.checkState(HddsUtils.isReadOnly(request));
+    return sendCommandWithRetry(request, excludeDns);
+  }
+
+  private XceiverClientReply sendCommandWithRetry(
+      ContainerCommandRequestProto request, List<DatanodeDetails> excludeDns)
+      throws IOException {
     ContainerCommandResponseProto responseProto = null;
 
     // In case of an exception or an error, we will try to read from the
@@ -211,12 +231,23 @@ public class XceiverClientGrpc extends XceiverClientSpi {
     // TODO: cache the correct leader info in here, so that any subsequent calls
     // should first go to leader
     List<DatanodeDetails> dns = pipeline.getNodes();
-    for (DatanodeDetails dn : dns) {
+    List<DatanodeDetails> healthyDns =
+        excludeDns != null ? dns.stream().filter(dnId -> {
+          for (DatanodeDetails excludeId : excludeDns) {
+            if (dnId.equals(excludeId)) {
+              return false;
+            }
+          }
+          return true;
+        }).collect(Collectors.toList()) : dns;
+    XceiverClientReply reply = new XceiverClientReply(null);
+    for (DatanodeDetails dn : healthyDns) {
       try {
         LOG.debug("Executing command " + request + " on datanode " + dn);
         // In case the command gets retried on a 2nd datanode,
         // sendCommandAsyncCall will create a new channel and async stub
         // in case these don't exist for the specific datanode.
+        reply.addDatanode(dn);
         responseProto = sendCommandAsync(request, dn).getResponse().get();
         if (responseProto.getResult() == ContainerProtos.Result.SUCCESS) {
           break;
@@ -226,14 +257,15 @@ public class XceiverClientGrpc extends XceiverClientSpi {
             .getUuidString(), e);
         if (Status.fromThrowable(e.getCause()).getCode()
             == Status.UNAUTHENTICATED.getCode()) {
-          throw new SCMSecurityException("Failed to authenticate with " +
-              "GRPC XceiverServer with Ozone block token.");
+          throw new SCMSecurityException("Failed to authenticate with "
+              + "GRPC XceiverServer with Ozone block token.");
         }
       }
     }
 
     if (responseProto != null) {
-      return responseProto;
+      reply.setResponse(CompletableFuture.completedFuture(responseProto));
+      return reply;
     } else {
       throw new IOException(
           "Failed to execute command " + request + " on the pipeline "
@@ -256,23 +288,26 @@ public class XceiverClientGrpc extends XceiverClientSpi {
    * @throws IOException
    */
   @Override
-  public XceiverClientAsyncReply sendCommandAsync(
+  public XceiverClientReply sendCommandAsync(
       ContainerCommandRequestProto request)
       throws IOException, ExecutionException, InterruptedException {
-    XceiverClientAsyncReply asyncReply =
-        sendCommandAsync(request, pipeline.getFirstNode());
-
-    // TODO : for now make this API sync in nature as async requests are
-    // served out of order over XceiverClientGrpc. This needs to be fixed
-    // if this API is to be used for I/O path. Currently, this is not
-    // used for Read/Write Operation but for tests.
-    if (!HddsUtils.isReadOnly(request)) {
-      asyncReply.getResponse().get();
+    try (Scope scope = GlobalTracer.get()
+        .buildSpan("XceiverClientGrpc." + request.getCmdType().name())
+        .startActive(true)) {
+      XceiverClientReply asyncReply =
+          sendCommandAsync(request, pipeline.getFirstNode());
+      // TODO : for now make this API sync in nature as async requests are
+      // served out of order over XceiverClientGrpc. This needs to be fixed
+      // if this API is to be used for I/O path. Currently, this is not
+      // used for Read/Write Operation but for tests.
+      if (!HddsUtils.isReadOnly(request)) {
+        asyncReply.getResponse().get();
+      }
+      return asyncReply;
     }
-    return asyncReply;
   }
 
-  private XceiverClientAsyncReply sendCommandAsync(
+  private XceiverClientReply sendCommandAsync(
       ContainerCommandRequestProto request, DatanodeDetails dn)
       throws IOException, ExecutionException, InterruptedException {
     if (closed) {
@@ -327,7 +362,7 @@ public class XceiverClientGrpc extends XceiverClientSpi {
             });
     requestObserver.onNext(request);
     requestObserver.onCompleted();
-    return new XceiverClientAsyncReply(replyFuture);
+    return new XceiverClientReply(replyFuture);
   }
 
   private void reconnect(DatanodeDetails dn, String encodedToken)
@@ -347,11 +382,11 @@ public class XceiverClientGrpc extends XceiverClientSpi {
   }
 
   @Override
-  public long watchForCommit(long index, long timeout)
+  public XceiverClientReply watchForCommit(long index, long timeout)
       throws InterruptedException, ExecutionException, TimeoutException,
       IOException {
     // there is no notion of watch for commit index in standalone pipeline
-    return 0;
+    return null;
   };
 
   public long getReplicatedMinCommitIndex() {

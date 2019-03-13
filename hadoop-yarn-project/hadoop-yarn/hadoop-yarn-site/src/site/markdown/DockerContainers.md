@@ -132,6 +132,15 @@ The following properties should be set in yarn-site.xml:
   </property>
 
   <property>
+    <name>yarn.nodemanager.runtime.linux.docker.image-update</name>
+    <value>false</value>
+    <description>
+      Optional. Default option to decide whether to pull the latest image
+      or not.
+    </description>
+  </property>
+
+  <property>
     <name>yarn.nodemanager.runtime.linux.docker.allowed-container-networks</name>
     <value>host,none,bridge</value>
     <description>
@@ -631,9 +640,21 @@ Privileged Container Security Consideration
 
 Privileged docker container can interact with host system devices.  This can cause harm to host operating system without proper care.  In order to mitigate risk of allowing privileged container to run on Hadoop cluster, we implemented a controlled process to sandbox unauthorized privileged docker images.
 
-The default behavior is disallow any privileged docker containers.  When `docker.privileged-containers.enabled` is set to enabled, docker image can run with root privileges in the docker container, but access to host level devices are disabled.  This allows developer and tester to run docker images from internet without causing harm to host operating system.
+The default behavior disallows any privileged docker containers.  Privileged docker is only allowed with ENTRYPOINT enabled docker image, and `docker.privileged-containers.enabled` is set to enabled.  Docker image can run with root privileges in the docker container, but access to host level devices are disabled.  This allows developer and tester to run docker images from internet with some restrictions to prevent harm to host operating system.
 
-When docker images have been certified by developers and testers to be trustworthy.  The trusted image can be promoted to trusted docker registry.  System administrator can define `docker.trusted.registries`, and setup private docker registry server to promote trusted images.
+When docker images have been certified by developers and testers to be trustworthy.  The trusted image can be promoted to trusted docker registry.  System administrator can define `docker.trusted.registries`, and setup private docker registry server to promote trusted images.  System administrator may choose to allow official docker images from Docker Hub to be part of trusted registries.  "library" is the name to use for trusting official docker images.  Container-executor.cfg example:
+
+```
+[docker]
+  docker.privileged-containers.enabled=true
+  docker.trusted.registries=library
+```
+
+In development environment, local images can be tagged with a repository name prefix to enable trust.  The recommendation of choosing a repository name is using a local hostname and port number to prevent accidentially pulling docker images from Docker Hub or use reserved Docker Hub keyword: "local".  Docker run will look for docker images on Docker Hub, if the image does not exist locally.  Using a local hostname and port in image name can prevent accidental pulling of canonical images from docker hub.  Example of tagging image with localhost:5000 as trusted registry:
+
+```
+docker tag centos:latest localhost:5000/centos:latest
+```
 
 Trusted images are allowed to mount external devices such as HDFS via NFS gateway, or host level Hadoop configuration.  If system administrators allow writing to external volumes using `docker.allow.rw-mounts directive`, privileged docker container can have full control of host level files in the predefined volumes.
 
@@ -654,8 +675,8 @@ will fail and the container will be killed on NodeManager restart.
 proc     /proc     proc     nosuid,nodev,noexec,hidepid=2,gid=yarn     0 0
 ```
 
-Connecting to a Secure Docker Repository
-----------------------------------------
+Connecting to a Docker Trusted Registry
+--------------------------------------
 
 The Docker client command will draw its configuration from the default location,
 which is $HOME/.docker/config.json on the NodeManager host. The Docker
@@ -682,6 +703,183 @@ host into the secure repo using the Docker login command:
 
 Note that this approach means that all users will have access to the secure
 repo.
+
+Hadoop integrates with Docker Trusted Registry via YARN service API.  Docker registry can store Docker images on HDFS, S3 or external storage using CSI driver.
+
+### Docker Registry on HDFS
+
+NFS Gateway provides capability to mount HDFS as NFS mount point.  Docker Registry can configure to write to HDFS mount point using standard file system API.
+
+In hdfs-site.xml, configure NFS configuration:
+
+```
+    <property>
+      <name>nfs.exports.allowed.hosts</name>
+      <value>* rw</value>
+    </property>
+
+    <property>
+      <name>nfs.file.dump.dir</name>
+      <value>/tmp/.hdfs-nfs</value>
+    </property>
+
+    <property>
+      <name>nfs.kerberos.principal</name>
+      <value>nfs/_HOST@EXAMPLE.COM</value>
+    </property>
+
+    <property>
+      <name>nfs.keytab.file</name>
+      <value>/etc/security/keytabs/nfs.service.keytab</value>
+    </property>
+```
+
+Run NFS Gateway on all datanodes as hdfs user using:
+
+```
+$ $HADOOP_HOME/bin/hdfs --daemon start nfs3
+```
+
+On each datanode, nfs mount point is exposed to /hdfs, using:
+
+```
+# mount -t nfs -o vers=3,proto=tcp,nolock,noacl,sync $DN_IP:/ /hdfs
+```
+
+Where DN_IP is the IP address of the datanode.
+
+Container-executor.cfg is configured to allow trusted Docker images from library.
+
+```
+[docker]
+  docker.privileged-containers.enabled=true
+  docker.trusted.registries=library,registry.docker-registry.registry.example.com:5000
+  docker.allowed.rw-mounts=/tmp,/usr/local/hadoop/logs,/hdfs
+```
+
+Docker Registry can be started using YARN service:
+registry.json
+
+```
+{
+  "name": "docker-registry",
+  "version": "1.0",
+  "kerberos_principal" : {
+    "principal_name" : "registry/_HOST@EXAMPLE.COM",
+    "keytab" : "file:///etc/security/keytabs/registry.service.keytab"
+  },
+  "components" :
+  [
+    {
+      "name": "registry",
+      "number_of_containers": 1,
+      "artifact": {
+        "id": "registry:latest",
+        "type": "DOCKER"
+      },
+      "resource": {
+        "cpus": 1,
+        "memory": "256"
+      },
+      "run_privileged_container": true,
+      "configuration": {
+        "env": {
+          "YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE":"true",
+          "YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS":"/hdfs/apps/docker/registry:/var/lib/registry"
+        },
+        "properties": {
+          "docker.network": "host"
+        }
+      }
+    }
+  ]
+}
+```
+
+YARN service configures docker mounts from /hdfs/apps/docker/registry to /var/lib/registry inside docker container.
+
+```
+yarn app -launch docker-registry /tmp/registry.json
+```
+
+Docker trusted registry is deployed in YARN framework, and the URL to access the registry following Hadoop Registry DNS format:
+
+```
+registry.docker-registry.$USER.$DOMAIN:5000
+```
+
+When docker-registry application reaches STABLE state in YARN, user can push or pull docker images to Docker Trusted Registry by prefix image name with registry.docker-registry.registry.example.com:5000/.
+
+### Docker Registry on S3
+
+Docker Registry provides its own S3 driver and YAML configuration.  YARN service configuration can generate YAML template, and enable direct Docker Registry to S3 storage.  This option is the top choice for deploying Docker Trusted Registry on AWS.
+Configuring Docker registry storage driver to S3 requires mounting /etc/docker/registry/config.yml file (through YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS), which needs to configure an S3 bucket with its corresponding accesskey and secretKey.
+
+Sample config.yml
+```
+version: 0.1
+log:
+    fields:
+        service: registry
+http:
+    addr: :5000
+storage:
+    cache:
+        blobdescriptor: inmemory
+    s3:
+        accesskey: #AWS_KEY#
+        secretkey: #AWS_SECRET#
+        region: #AWS_REGION#
+        bucket: #AWS_BUCKET#
+        encrypt: #ENCRYPT#
+        secure:  #SECURE#
+        chunksize: 5242880
+        multipartcopychunksize: 33554432
+        multipartcopymaxconcurrency: 100
+        multipartcopythresholdsize: 33554432
+        rootdirectory: #STORAGE_PATH#
+```
+
+Docker Registry can be started using YARN service:
+registry.json
+
+```
+{
+  "name": "docker-registry",
+  "version": "1.0",
+  "kerberos_principal" : {
+    "principal_name" : "registry/_HOST@EXAMPLE.COM",
+    "keytab" : "file:///etc/security/keytabs/registry.service.keytab"
+  },
+  "components" :
+  [
+    {
+      "name": "registry",
+      "number_of_containers": 1,
+      "artifact": {
+        "id": "registry:latest",
+        "type": "DOCKER"
+      },
+      "resource": {
+        "cpus": 1,
+        "memory": "256"
+      },
+      "run_privileged_container": true,
+      "configuration": {
+        "env": {
+          "YARN_CONTAINER_RUNTIME_DOCKER_RUN_OVERRIDE_DISABLE":"true",
+          "YARN_CONTAINER_RUNTIME_DOCKER_MOUNTS":"<path to config.yml>:/etc/docker/registry/config.yml",
+        },
+        "properties": {
+          "docker.network": "host"
+        }
+      }
+    }
+  ]
+}
+```
+
+For further details and parameters that could be configured in the S3 storage driver, please refer https://docs.docker.com/registry/storage-drivers/s3/.
 
 Example: MapReduce
 ------------------

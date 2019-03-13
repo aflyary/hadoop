@@ -24,8 +24,8 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.security.AccessControlException;
@@ -82,7 +82,8 @@ import org.apache.hadoop.yarn.util.StringHelper;
 public class RMAppManager implements EventHandler<RMAppManagerEvent>, 
                                         Recoverable {
 
-  private static final Log LOG = LogFactory.getLog(RMAppManager.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(RMAppManager.class);
 
   private int maxCompletedAppsInMemory;
   private int maxCompletedAppsInStateStore;
@@ -95,6 +96,7 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
   private final ApplicationACLsManager applicationACLsManager;
   private Configuration conf;
   private YarnAuthorizationProvider authorizer;
+  private boolean timelineServiceV2Enabled;
 
   public RMAppManager(RMContext context,
       YarnScheduler scheduler, ApplicationMasterService masterService,
@@ -115,13 +117,16 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
       this.maxCompletedAppsInStateStore = this.maxCompletedAppsInMemory;
     }
     this.authorizer = YarnAuthorizationProvider.getInstance(conf);
+    this.timelineServiceV2Enabled = YarnConfiguration.
+        timelineServiceV2Enabled(conf);
   }
 
   /**
    *  This class is for logging the application summary.
    */
   static class ApplicationSummary {
-    static final Log LOG = LogFactory.getLog(ApplicationSummary.class);
+    static final Logger LOG = LoggerFactory.
+        getLogger(ApplicationSummary.class);
 
     // Escape sequences 
     static final char EQUALS = '=';
@@ -211,7 +216,7 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
      */
     public static void logAppSummary(RMApp app) {
       if (app != null) {
-        LOG.info(createAppSummary(app));
+        LOG.info(createAppSummary(app).toString());
       }
     }
   }
@@ -493,7 +498,7 @@ public class RMAppManager implements EventHandler<RMAppManagerEvent>,
       throw new YarnException(message);
     }
 
-    if (YarnConfiguration.timelineServiceV2Enabled(conf)) {
+    if (timelineServiceV2Enabled) {
       // Start timeline collector for the submitted app
       application.startTimelineCollector();
     }

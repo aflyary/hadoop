@@ -30,10 +30,10 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.s3a.AWSCredentialProviderList;
 import org.apache.hadoop.fs.s3a.S3AFileSystem;
 import org.apache.hadoop.fs.s3a.auth.RoleModel;
-import org.apache.hadoop.fs.s3a.commit.DurationInfo;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.token.SecretManager;
 import org.apache.hadoop.security.token.Token;
+import org.apache.hadoop.util.DurationInfo;
 
 import static java.util.Objects.requireNonNull;
 import static org.apache.hadoop.fs.s3a.auth.delegation.DelegationConstants.DURATION_LOG_AT_INFO;
@@ -173,8 +173,10 @@ public abstract class AbstractDelegationTokenBinding extends AbstractDTService {
    * Verify that a token identifier is of a specific class.
    * This will reject subclasses (i.e. it is stricter than
    * {@code instanceof}, then cast it to that type.
+   * @param <T> type of S3A delegation ttoken identifier.
    * @param identifier identifier to validate
    * @param expectedClass class of the expected token identifier.
+   * @return token identifier.
    * @throws DelegationTokenIOException If the wrong class was found.
    */
   protected <T extends AbstractS3ATokenIdentifier> T convertTokenIdentifier(

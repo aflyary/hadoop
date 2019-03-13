@@ -29,6 +29,7 @@ import org.apache.hadoop.hdds.scm.events.SCMEvents;
 import org.apache.hadoop.hdds.scm.node.NodeManager;
 import org.apache.hadoop.hdds.server.ServerUtils;
 import org.apache.hadoop.hdds.server.events.EventPublisher;
+import org.apache.hadoop.metrics2.util.MBeans;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.utils.MetadataKeyFilters;
 import org.apache.hadoop.utils.MetadataStore;
@@ -36,11 +37,15 @@ import org.apache.hadoop.utils.MetadataStoreBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import javax.management.ObjectName;
 import java.io.File;
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Set;
+import java.util.Collection;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -67,6 +72,9 @@ public class SCMPipelineManager implements PipelineManager {
 
   private final EventPublisher eventPublisher;
   private final NodeManager nodeManager;
+  private final SCMPipelineMetrics metrics;
+  // Pipeline Manager MXBean
+  private ObjectName pmInfoBean;
 
   public SCMPipelineManager(Configuration conf, NodeManager nodeManager,
       EventPublisher eventPublisher) throws IOException {
@@ -86,7 +94,19 @@ public class SCMPipelineManager implements PipelineManager {
             .build();
     this.eventPublisher = eventPublisher;
     this.nodeManager = nodeManager;
+    this.metrics = SCMPipelineMetrics.create();
+    this.pmInfoBean = MBeans.register("SCMPipelineManager",
+        "SCMPipelineManagerInfo", this);
     initializePipelineState();
+  }
+
+  public PipelineStateManager getStateManager() {
+    return stateManager;
+  }
+
+  public void setPipelineProvider(ReplicationType replicationType,
+                                  PipelineProvider provider) {
+    pipelineFactory.setProvider(replicationType, provider);
   }
 
   private void initializePipelineState() throws IOException {
@@ -114,12 +134,16 @@ public class SCMPipelineManager implements PipelineManager {
       ReplicationType type, ReplicationFactor factor) throws IOException {
     lock.writeLock().lock();
     try {
-      Pipeline pipeline =  pipelineFactory.create(type, factor);
+      Pipeline pipeline = pipelineFactory.create(type, factor);
       pipelineStore.put(pipeline.getId().getProtobuf().toByteArray(),
           pipeline.getProtobufMessage().toByteArray());
       stateManager.addPipeline(pipeline);
       nodeManager.addPipeline(pipeline);
+      metrics.incNumPipelineCreated();
       return pipeline;
+    } catch (IOException ex) {
+      metrics.incNumPipelineCreationFailed();
+      throw ex;
     } finally {
       lock.writeLock().unlock();
     }
@@ -129,6 +153,7 @@ public class SCMPipelineManager implements PipelineManager {
   public Pipeline createPipeline(ReplicationType type, ReplicationFactor factor,
                                  List<DatanodeDetails> nodes) {
     // This will mostly be used to create dummy pipeline for SimplePipelines.
+    // We don't update the metrics for SimplePipelines.
     lock.writeLock().lock();
     try {
       return pipelineFactory.create(type, factor, nodes);
@@ -191,6 +216,20 @@ public class SCMPipelineManager implements PipelineManager {
   }
 
   @Override
+  public List<Pipeline> getPipelines(ReplicationType type,
+      ReplicationFactor factor, Pipeline.PipelineState state,
+      Collection<DatanodeDetails> excludeDns,
+      Collection<PipelineID> excludePipelines) {
+    lock.readLock().lock();
+    try {
+      return stateManager
+          .getPipelines(type, factor, state, excludeDns, excludePipelines);
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
   public void addContainerToPipeline(PipelineID pipelineID,
       ContainerID containerID) throws IOException {
     lock.writeLock().lock();
@@ -213,8 +252,8 @@ public class SCMPipelineManager implements PipelineManager {
   }
 
   @Override
-  public Set<ContainerID> getContainersInPipeline(PipelineID pipelineID)
-      throws IOException {
+  public NavigableSet<ContainerID> getContainersInPipeline(
+      PipelineID pipelineID) throws IOException {
     lock.readLock().lock();
     try {
       return stateManager.getContainers(pipelineID);
@@ -259,15 +298,42 @@ public class SCMPipelineManager implements PipelineManager {
       pipelineStore.delete(pipelineID.getProtobuf().toByteArray());
       Pipeline pipeline = stateManager.removePipeline(pipelineID);
       nodeManager.removePipeline(pipeline);
+      metrics.incNumPipelineDestroyed();
+    } catch (IOException ex) {
+      metrics.incNumPipelineDestroyFailed();
+      throw ex;
     } finally {
       lock.writeLock().unlock();
     }
   }
 
   @Override
+  public Map<String, Integer> getPipelineInfo() {
+    final Map<String, Integer> pipelineInfo = new HashMap<>();
+    for (Pipeline.PipelineState state : Pipeline.PipelineState.values()) {
+      pipelineInfo.put(state.toString(), 0);
+    }
+    stateManager.getPipelines().forEach(pipeline ->
+        pipelineInfo.computeIfPresent(
+            pipeline.getPipelineState().toString(), (k, v) -> v + 1));
+    return pipelineInfo;
+  }
+
+  @Override
   public void close() throws IOException {
+    if (pipelineFactory != null) {
+      pipelineFactory.close();
+    }
+
     if (pipelineStore != null) {
       pipelineStore.close();
+    }
+    if(pmInfoBean != null) {
+      MBeans.unregister(this.pmInfoBean);
+      pmInfoBean = null;
+    }
+    if(metrics != null) {
+      metrics.unRegister();
     }
   }
 }

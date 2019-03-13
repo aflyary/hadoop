@@ -17,7 +17,7 @@
 Resource            ../commonlib.robot
 
 *** Variables ***
-${OZONE_S3_HEADER_VERSION}     v2
+${OZONE_S3_HEADER_VERSION}     v4
 ${OZONE_S3_SET_CREDENTIALS}    true
 
 *** Keywords ***
@@ -39,7 +39,12 @@ Execute AWSS3Cli
 Install aws cli
     ${rc}              ${output} =                 Run And Return Rc And Output           which apt-get
     Run Keyword if     '${rc}' == '0'              Install aws cli s3 debian
+    ${rc}              ${output} =                 Run And Return Rc And Output           yum --help
+    Run Keyword if     '${rc}' == '0'              Install aws cli s3 centos
 
+
+Install aws cli s3 centos
+    Execute                    sudo yum install -y awscli
 Install aws cli s3 debian
     Execute                    sudo apt-get install -y awscli
 

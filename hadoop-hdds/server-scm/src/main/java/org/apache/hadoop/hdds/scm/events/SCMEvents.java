@@ -21,6 +21,7 @@ package org.apache.hadoop.hdds.scm.events;
 
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.scm.block.PendingDeleteStatusList;
+import org.apache.hadoop.hdds.scm.chillmode.SCMChillModeManager.ChillModeStatus;
 import org.apache.hadoop.hdds.scm.command.CommandStatusReportHandler;
 import org.apache.hadoop.hdds.scm.command.CommandStatusReportHandler
     .ReplicationStatus;
@@ -104,6 +105,14 @@ public final class SCMEvents {
           new TypedEvent<>(PipelineReportFromDatanode.class, "Pipeline_Report");
 
   /**
+   * PipelineReport processed by pipeline report handler. This event is
+   * received by HealthyPipelineChillModeRule.
+   */
+  public static final TypedEvent<PipelineReportFromDatanode>
+      PROCESSED_PIPELINE_REPORT = new TypedEvent<>(
+          PipelineReportFromDatanode.class, "Processed_Pipeline_Report");
+
+  /**
    * PipelineActions are sent by Datanode. This event is received by
    * SCMDatanodeHeartbeatDispatcher and PIPELINE_ACTIONS event is generated.
    */
@@ -167,6 +176,13 @@ public final class SCMEvents {
    */
   public static final TypedEvent<DatanodeDetails> DEAD_NODE =
       new TypedEvent<>(DatanodeDetails.class, "Dead_Node");
+
+  /**
+   * This event will be triggered whenever a datanode is moved from non-healthy
+   * state to healthy state.
+   */
+  public static final TypedEvent<DatanodeDetails> NON_HEALTHY_TO_HEALTHY_NODE =
+      new TypedEvent<>(DatanodeDetails.class, "NON_HEALTHY_TO_HEALTHY_NODE");
 
   /**
    * This event will be triggered by CommandStatusReportHandler whenever a
@@ -238,8 +254,8 @@ public final class SCMEvents {
    */
   public static final TypedEvent<Boolean> START_REPLICATION =
       new TypedEvent<>(Boolean.class);
-  public static final TypedEvent<Boolean> CHILL_MODE_STATUS =
-      new TypedEvent<>(Boolean.class);
+  public static final TypedEvent<ChillModeStatus> CHILL_MODE_STATUS =
+      new TypedEvent<>(ChillModeStatus.class);
 
   /**
    * Private Ctor. Never Constructed.

@@ -18,8 +18,9 @@
 
 package org.apache.hadoop.hdds.scm.storage;
 import com.google.common.base.Preconditions;
+import org.apache.hadoop.hdds.protocol.DatanodeDetails;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
-import org.apache.hadoop.hdds.scm.XceiverClientAsyncReply;
+import org.apache.hadoop.hdds.scm.XceiverClientReply;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.ozone.common.Checksum;
@@ -29,6 +30,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.apache.hadoop.hdds.scm.XceiverClientManager;
 import org.apache.hadoop.hdds.scm.XceiverClientSpi;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChecksumType;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ChunkInfo;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.BlockData;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.KeyValue;
@@ -38,8 +40,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.OutputStream;
-import java.nio.Buffer;
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.UUID;
 import java.util.List;
 import java.util.ArrayList;
@@ -76,14 +78,15 @@ public class BlockOutputStream extends OutputStream {
   private final BlockData.Builder containerBlockData;
   private XceiverClientManager xceiverClientManager;
   private XceiverClientSpi xceiverClient;
-  private final Checksum checksum;
+  private final ContainerProtos.ChecksumType checksumType;
+  private final int bytesPerChecksum;
   private final String streamId;
   private int chunkIndex;
   private int chunkSize;
   private final long streamBufferFlushSize;
   private final long streamBufferMaxSize;
   private final long watchTimeout;
-  private List<ByteBuffer> bufferList;
+  private BufferPool bufferPool;
   // The IOException will be set by response handling thread in case there is an
   // exception received in the response. If the exception is set, the next
   // request will fail upfront.
@@ -100,13 +103,14 @@ public class BlockOutputStream extends OutputStream {
   // by all servers
   private long totalAckDataLength;
 
-  // list to hold up all putBlock futures
-  private List<CompletableFuture<ContainerProtos.ContainerCommandResponseProto>>
-      futureList;
+  // future Map to hold up all putBlock futures
+  private ConcurrentHashMap<Long,
+      CompletableFuture<ContainerProtos.ContainerCommandResponseProto>>
+      futureMap;
   // map containing mapping for putBlock logIndex to to flushedDataLength Map.
   private ConcurrentHashMap<Long, Long> commitIndex2flushedDataMap;
 
-  private int currentBufferIndex;
+  private List<DatanodeDetails> failedServers;
 
   /**
    * Creates a new BlockOutputStream.
@@ -117,18 +121,20 @@ public class BlockOutputStream extends OutputStream {
    * @param pipeline             pipeline where block will be written
    * @param traceID              container protocol call args
    * @param chunkSize            chunk size
-   * @param bufferList           list of byte buffers
+   * @param bufferPool           pool of buffers
    * @param streamBufferFlushSize flush size
    * @param streamBufferMaxSize   max size of the currentBuffer
    * @param watchTimeout          watch timeout
-   * @param checksum              checksum
+   * @param checksumType          checksum type
+   * @param bytesPerChecksum      Bytes per checksum
    */
   @SuppressWarnings("parameternumber")
   public BlockOutputStream(BlockID blockID, String key,
       XceiverClientManager xceiverClientManager, Pipeline pipeline,
       String traceID, int chunkSize, long streamBufferFlushSize,
-      long streamBufferMaxSize, long watchTimeout, List<ByteBuffer> bufferList,
-      Checksum checksum) throws IOException {
+      long streamBufferMaxSize, long watchTimeout, BufferPool bufferPool,
+      ChecksumType checksumType, int bytesPerChecksum)
+      throws IOException {
     this.blockID = blockID;
     this.key = key;
     this.traceID = traceID;
@@ -145,17 +151,18 @@ public class BlockOutputStream extends OutputStream {
     this.streamBufferFlushSize = streamBufferFlushSize;
     this.streamBufferMaxSize = streamBufferMaxSize;
     this.watchTimeout = watchTimeout;
-    this.bufferList = bufferList;
-    this.checksum = checksum;
+    this.bufferPool = bufferPool;
+    this.checksumType = checksumType;
+    this.bytesPerChecksum = bytesPerChecksum;
 
     // A single thread executor handle the responses of async requests
     responseExecutor = Executors.newSingleThreadExecutor();
     commitIndex2flushedDataMap = new ConcurrentHashMap<>();
     totalAckDataLength = 0;
-    futureList = new ArrayList<>();
+    futureMap = new ConcurrentHashMap<>();
     totalDataFlushedLength = 0;
-    currentBufferIndex = 0;
     writtenDataLength = 0;
+    failedServers = Collections.emptyList();
   }
 
   public BlockID getBlockID() {
@@ -170,13 +177,9 @@ public class BlockOutputStream extends OutputStream {
     return writtenDataLength;
   }
 
-  private long computeBufferData() {
-    int dataLength =
-        bufferList.stream().mapToInt(Buffer::position).sum();
-    Preconditions.checkState(dataLength <= streamBufferMaxSize);
-    return dataLength;
+  public List<DatanodeDetails> getFailedServers() {
+    return failedServers;
   }
-
 
   @Override
   public void write(int b) throws IOException {
@@ -188,6 +191,7 @@ public class BlockOutputStream extends OutputStream {
 
   @Override
   public void write(byte[] b, int off, int len) throws IOException {
+    checkOpen();
     if (b == null) {
       throw new NullPointerException();
     }
@@ -199,53 +203,40 @@ public class BlockOutputStream extends OutputStream {
       return;
     }
     while (len > 0) {
-      checkOpen();
       int writeLen;
-      allocateBuffer();
-      ByteBuffer currentBuffer = getCurrentBuffer();
+
+      // Allocate a buffer if needed. The buffer will be allocated only
+      // once as needed and will be reused again for mutiple blockOutputStream
+      // entries.
+      ByteBuffer  currentBuffer = bufferPool.allocateBufferIfNeeded();
+      int pos = currentBuffer.position();
       writeLen =
-          Math.min(chunkSize - currentBuffer.position() % chunkSize, len);
+          Math.min(chunkSize - pos % chunkSize, len);
       currentBuffer.put(b, off, writeLen);
-      if (currentBuffer.position() % chunkSize == 0) {
-        int pos = currentBuffer.position() - chunkSize;
-        int limit = currentBuffer.position();
-        writeChunk(pos, limit);
+      if (!currentBuffer.hasRemaining()) {
+        writeChunk(currentBuffer);
       }
       off += writeLen;
       len -= writeLen;
       writtenDataLength += writeLen;
-      if (currentBuffer.position() == streamBufferFlushSize) {
+      if (shouldFlush()) {
         totalDataFlushedLength += streamBufferFlushSize;
         handlePartialFlush();
       }
-      long bufferedData = computeBufferData();
-      // Data in the bufferList can not exceed streamBufferMaxSize
-      if (bufferedData == streamBufferMaxSize) {
+      // Data in the bufferPool can not exceed streamBufferMaxSize
+      if (isBufferPoolFull()) {
         handleFullBuffer();
       }
     }
   }
 
-  private ByteBuffer getCurrentBuffer() {
-    ByteBuffer buffer = bufferList.get(currentBufferIndex);
-    if (!buffer.hasRemaining()) {
-      currentBufferIndex =
-          currentBufferIndex < getMaxNumBuffers() - 1 ? ++currentBufferIndex :
-              0;
-    }
-    return bufferList.get(currentBufferIndex);
+  private boolean shouldFlush() {
+    return writtenDataLength % streamBufferFlushSize == 0;
   }
 
-  private int getMaxNumBuffers() {
-    return (int)(streamBufferMaxSize/streamBufferFlushSize);
+  private boolean isBufferPoolFull() {
+    return bufferPool.computeBufferData() == streamBufferMaxSize;
   }
-
-  private void allocateBuffer() {
-    for (int i = bufferList.size(); i < getMaxNumBuffers(); i++) {
-      bufferList.add(ByteBuffer.allocate((int)streamBufferFlushSize));
-    }
-  }
-
   /**
    * Will be called on the retryPath in case closedContainerException/
    * TimeoutException.
@@ -258,51 +249,54 @@ public class BlockOutputStream extends OutputStream {
     if (len == 0) {
       return;
     }
-    int off = 0;
-    int pos = off;
+    int count = 0;
+    Preconditions.checkArgument(len <= streamBufferMaxSize);
     while (len > 0) {
       long writeLen;
       writeLen = Math.min(chunkSize, len);
       if (writeLen == chunkSize) {
-        int limit = pos + chunkSize;
-        writeChunk(pos, limit);
+        writeChunk(bufferPool.getBuffer(count));
       }
-      off += writeLen;
       len -= writeLen;
+      count++;
       writtenDataLength += writeLen;
-      if (off % streamBufferFlushSize == 0) {
-        // reset the position to zero as now we wll readng thhe next buffer in
-        // the list
-        pos = 0;
+      if (shouldFlush()) {
+        // reset the position to zero as now we will be reading the
+        // next buffer in the list
         totalDataFlushedLength += streamBufferFlushSize;
         handlePartialFlush();
       }
-      if (computeBufferData() % streamBufferMaxSize == 0) {
+
+      // we should not call isBufferFull here. The buffer might already be full
+      // as whole data is already cached in the buffer. We should just validate
+      // if we wrote data of size streamBufferMaxSize to call for handling
+      // full buffer condition.
+      if (writtenDataLength == streamBufferMaxSize) {
         handleFullBuffer();
       }
     }
   }
 
   /**
-   * just update the totalAckDataLength. Since we have allocated
-   * the currentBuffer more than the streamBufferMaxSize, we can keep on writing
-   * to the currentBuffer. In case of failure, we will read the data starting
-   * from totalAckDataLength.
+   * just update the totalAckDataLength. In case of failure,
+   * we will read the data starting from totalAckDataLength.
    */
   private void updateFlushIndex(long index) {
     if (!commitIndex2flushedDataMap.isEmpty()) {
       Preconditions.checkState(commitIndex2flushedDataMap.containsKey(index));
       totalAckDataLength = commitIndex2flushedDataMap.remove(index);
       LOG.debug("Total data successfully replicated: " + totalAckDataLength);
-      futureList.remove(0);
+      futureMap.remove(totalAckDataLength);
       // Flush has been committed to required servers successful.
-      // just swap the bufferList head and tail after clearing.
-      ByteBuffer currentBuffer = bufferList.remove(0);
-      currentBuffer.clear();
-      if (currentBufferIndex != 0) {
-        currentBufferIndex--;
+      // just release the current buffer from the buffer pool.
+
+      // every entry removed from the putBlock future Map signifies
+      // streamBufferFlushSize/chunkSize no of chunks successfully committed.
+      // Release the buffers from the buffer pool to be reused again.
+      int chunkCount = (int) (streamBufferFlushSize / chunkSize);
+      for (int i = 0; i < chunkCount; i++) {
+        bufferPool.releaseBuffer();
       }
-      bufferList.add(currentBuffer);
     }
   }
 
@@ -315,7 +309,7 @@ public class BlockOutputStream extends OutputStream {
   private void handleFullBuffer() throws IOException {
     try {
       checkOpen();
-      if (!futureList.isEmpty()) {
+      if (!futureMap.isEmpty()) {
         waitOnFlushFutures();
       }
     } catch (InterruptedException | ExecutionException e) {
@@ -357,9 +351,22 @@ public class BlockOutputStream extends OutputStream {
   private void watchForCommit(long commitIndex) throws IOException {
     checkOpen();
     Preconditions.checkState(!commitIndex2flushedDataMap.isEmpty());
+    long index;
     try {
-      long index =
+      XceiverClientReply reply =
           xceiverClient.watchForCommit(commitIndex, watchTimeout);
+      if (reply == null) {
+        index = 0;
+      } else {
+        List<DatanodeDetails> dnList = reply.getDatanodes();
+        if (!dnList.isEmpty()) {
+          if (failedServers.isEmpty()) {
+            failedServers = new ArrayList<>();
+          }
+          failedServers.addAll(dnList);
+        }
+        index = reply.getLogIndex();
+      }
       adjustBuffers(index);
     } catch (TimeoutException | InterruptedException | ExecutionException e) {
       LOG.warn("watchForCommit failed for index " + commitIndex, e);
@@ -379,7 +386,7 @@ public class BlockOutputStream extends OutputStream {
     CompletableFuture<ContainerProtos.
         ContainerCommandResponseProto> flushFuture;
     try {
-      XceiverClientAsyncReply asyncReply =
+      XceiverClientReply asyncReply =
           putBlockAsync(xceiverClient, containerBlockData.build(), requestId);
       CompletableFuture<ContainerProtos.ContainerCommandResponseProto> future =
           asyncReply.getResponse();
@@ -387,8 +394,7 @@ public class BlockOutputStream extends OutputStream {
         try {
           validateResponse(e);
         } catch (IOException sce) {
-          future.completeExceptionally(sce);
-          return e;
+          throw new CompletionException(sce);
         }
         // if the ioException is not set, putBlock is successful
         if (ioException == null) {
@@ -417,102 +423,96 @@ public class BlockOutputStream extends OutputStream {
       throw new IOException(
           "Unexpected Storage Container Exception: " + e.toString(), e);
     }
-    futureList.add(flushFuture);
+    futureMap.put(flushPos, flushFuture);
     return flushFuture;
   }
 
   @Override
   public void flush() throws IOException {
     if (xceiverClientManager != null && xceiverClient != null
-        && bufferList != null) {
-      checkOpen();
-      int bufferSize = bufferList.size();
-      if (bufferSize > 0) {
-        try {
-          // flush the last chunk data residing on the currentBuffer
-          if (totalDataFlushedLength < writtenDataLength) {
-            ByteBuffer currentBuffer = getCurrentBuffer();
-            int pos = currentBuffer.position() - (currentBuffer.position()
-                % chunkSize);
-            int limit = currentBuffer.position() - pos;
-            writeChunk(pos, currentBuffer.position());
-            totalDataFlushedLength += limit;
-            handlePartialFlush();
-          }
-          waitOnFlushFutures();
-          // just check again if the exception is hit while waiting for the
-          // futures to ensure flush has indeed succeeded
-          checkOpen();
-        } catch (InterruptedException | ExecutionException e) {
-          adjustBuffersOnException();
-          throw new IOException(
-              "Unexpected Storage Container Exception: " + e.toString(), e);
-        }
+        && bufferPool != null && bufferPool.getSize() > 0) {
+      try {
+        handleFlush();
+      } catch (InterruptedException | ExecutionException e) {
+        adjustBuffersOnException();
+        throw new IOException(
+            "Unexpected Storage Container Exception: " + e.toString(), e);
       }
     }
   }
 
-  private void writeChunk(int pos, int limit) throws IOException {
+
+  private void writeChunk(ByteBuffer buffer)
+      throws IOException {
     // Please note : We are not flipping the slice when we write since
     // the slices are pointing the currentBuffer start and end as needed for
     // the chunk write. Also please note, Duplicate does not create a
     // copy of data, it only creates metadata that points to the data
     // stream.
-    ByteBuffer chunk = bufferList.get(currentBufferIndex).duplicate();
-    chunk.position(pos);
-    chunk.limit(limit);
+    ByteBuffer chunk = buffer.duplicate();
+    chunk.position(0);
+    chunk.limit(buffer.position());
     writeChunkToContainer(chunk);
+  }
+
+  private void handleFlush()
+      throws IOException, InterruptedException, ExecutionException {
+    checkOpen();
+    // flush the last chunk data residing on the currentBuffer
+    if (totalDataFlushedLength < writtenDataLength) {
+      ByteBuffer currentBuffer = bufferPool.getBuffer();
+      int pos = currentBuffer.position();
+      writeChunk(currentBuffer);
+      totalDataFlushedLength += pos;
+      handlePartialFlush();
+    }
+    waitOnFlushFutures();
+    // just check again if the exception is hit while waiting for the
+    // futures to ensure flush has indeed succeeded
+
+    // irrespective of whether the commitIndex2flushedDataMap is empty
+    // or not, ensure there is no exception set
+    checkOpen();
+
   }
 
   @Override
   public void close() throws IOException {
     if (xceiverClientManager != null && xceiverClient != null
-        && bufferList != null) {
-      int bufferSize = bufferList.size();
-      if (bufferSize > 0) {
-        try {
-          // flush the last chunk data residing on the currentBuffer
-          if (totalDataFlushedLength < writtenDataLength) {
-            ByteBuffer currentBuffer = getCurrentBuffer();
-            int pos = currentBuffer.position() - (currentBuffer.position()
-                % chunkSize);
-            int limit = currentBuffer.position() - pos;
-            writeChunk(pos, currentBuffer.position());
-            totalDataFlushedLength += limit;
-            handlePartialFlush();
-          }
-          waitOnFlushFutures();
-          // irrespective of whether the commitIndex2flushedDataMap is empty
-          // or not, ensure there is no exception set
-          checkOpen();
-          if (!commitIndex2flushedDataMap.isEmpty()) {
-            // wait for the last commit index in the commitIndex2flushedDataMap
-            // to get committed to all or majority of nodes in case timeout
-            // happens.
-            long lastIndex =
-                commitIndex2flushedDataMap.keySet().stream()
-                    .mapToLong(v -> v).max().getAsLong();
-            LOG.debug(
-                "waiting for last flush Index " + lastIndex + " to catch up");
-            watchForCommit(lastIndex);
-          }
-        } catch (InterruptedException | ExecutionException e) {
-          adjustBuffersOnException();
-          throw new IOException(
-              "Unexpected Storage Container Exception: " + e.toString(), e);
-        } finally {
-          cleanup(false);
+        && bufferPool != null && bufferPool.getSize() > 0) {
+      try {
+        handleFlush();
+        if (!commitIndex2flushedDataMap.isEmpty()) {
+          // wait for the last commit index in the commitIndex2flushedDataMap
+          // to get committed to all or majority of nodes in case timeout
+          // happens.
+          long lastIndex =
+              commitIndex2flushedDataMap.keySet().stream().mapToLong(v -> v)
+                  .max().getAsLong();
+          LOG.debug(
+              "waiting for last flush Index " + lastIndex + " to catch up");
+          watchForCommit(lastIndex);
         }
+      } catch (InterruptedException | ExecutionException e) {
+        adjustBuffersOnException();
+        throw new IOException(
+            "Unexpected Storage Container Exception: " + e.toString(), e);
+      } finally {
+        cleanup(false);
       }
-      // clear the currentBuffer
-      bufferList.stream().forEach(ByteBuffer::clear);
+      // TODO: Turn the below buffer empty check on whne Standalone pipeline
+      // is removed in the write path in tests
+      // Preconditions.checkArgument(buffer.position() == 0);
+      // bufferPool.checkBufferPoolEmpty();
+
     }
   }
 
+
   private void waitOnFlushFutures()
       throws InterruptedException, ExecutionException {
-    CompletableFuture<Void> combinedFuture = CompletableFuture
-        .allOf(futureList.toArray(new CompletableFuture[futureList.size()]));
+    CompletableFuture<Void> combinedFuture = CompletableFuture.allOf(
+        futureMap.values().toArray(new CompletableFuture[futureMap.size()]));
     // wait for all the transactions to complete
     combinedFuture.get();
   }
@@ -548,10 +548,10 @@ public class BlockOutputStream extends OutputStream {
     }
     xceiverClientManager = null;
     xceiverClient = null;
-    if (futureList != null) {
-      futureList.clear();
+    if (futureMap != null) {
+      futureMap.clear();
     }
-    futureList = null;
+    futureMap = null;
     if (commitIndex2flushedDataMap != null) {
       commitIndex2flushedDataMap.clear();
     }
@@ -585,6 +585,7 @@ public class BlockOutputStream extends OutputStream {
   private void writeChunkToContainer(ByteBuffer chunk) throws IOException {
     int effectiveChunkSize = chunk.remaining();
     ByteString data = ByteString.copyFrom(chunk);
+    Checksum checksum = new Checksum(checksumType, bytesPerChecksum);
     ChecksumData checksumData = checksum.computeChecksum(data);
     ChunkInfo chunkInfo = ChunkInfo.newBuilder()
         .setChunkName(DigestUtils.md5Hex(key) + "_stream_" + streamId +
@@ -598,7 +599,7 @@ public class BlockOutputStream extends OutputStream {
         traceID + ContainerProtos.Type.WriteChunk + chunkIndex + chunkInfo
             .getChunkName();
     try {
-      XceiverClientAsyncReply asyncReply =
+      XceiverClientReply asyncReply =
           writeChunkAsync(xceiverClient, chunkInfo, blockID, data, requestId);
       CompletableFuture<ContainerProtos.ContainerCommandResponseProto> future =
           asyncReply.getResponse();

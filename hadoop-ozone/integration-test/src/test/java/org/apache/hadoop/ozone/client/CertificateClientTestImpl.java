@@ -16,6 +16,7 @@
  */
 package org.apache.hadoop.ozone.client;
 
+import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.security.x509.SecurityConfig;
 import org.apache.hadoop.hdds.security.x509.certificate.client.CertificateClient;
@@ -26,6 +27,7 @@ import org.apache.hadoop.hdds.security.x509.keys.HDDSKeyGenerator;
 import org.bouncycastle.cert.X509CertificateHolder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.security.KeyPair;
 import java.security.PrivateKey;
@@ -45,14 +47,28 @@ public class CertificateClientTestImpl implements CertificateClient {
 
   private final SecurityConfig securityConfig;
   private final KeyPair keyPair;
-  private final X509Certificate cert;
+  private final Configuration config;
 
   public CertificateClientTestImpl(OzoneConfiguration conf) throws Exception{
     securityConfig = new SecurityConfig(conf);
     HDDSKeyGenerator keyGen =
         new HDDSKeyGenerator(securityConfig.getConfiguration());
     keyPair = keyGen.generateKey();
+    config = conf;
+  }
 
+  @Override
+  public PrivateKey getPrivateKey() {
+    return keyPair.getPrivate();
+  }
+
+  @Override
+  public PublicKey getPublicKey() {
+    return keyPair.getPublic();
+  }
+
+  @Override
+  public X509Certificate getCertificate() {
     SelfSignedCertificate.Builder builder =
         SelfSignedCertificate.newBuilder()
             .setBeginDate(LocalDate.now())
@@ -60,27 +76,17 @@ public class CertificateClientTestImpl implements CertificateClient {
             .setClusterID("cluster1")
             .setKey(keyPair)
             .setSubject("TestCertSub")
-            .setConfiguration(conf)
+            .setConfiguration(config)
             .setScmID("TestScmId1")
             .makeCA();
-
-    X509CertificateHolder certificateHolder = builder.build();
-    cert = new JcaX509CertificateConverter().getCertificate(certificateHolder);
-  }
-
-  @Override
-  public PrivateKey getPrivateKey(String component) {
-    return keyPair.getPrivate();
-  }
-
-  @Override
-  public PublicKey getPublicKey(String component) {
-    return keyPair.getPublic();
-  }
-
-  @Override
-  public X509Certificate getCertificate(String component) {
-    return cert;
+    X509CertificateHolder certificateHolder = null;
+    try {
+      certificateHolder = builder.build();
+      return new JcaX509CertificateConverter().getCertificate(
+          certificateHolder);
+    } catch (IOException | java.security.cert.CertificateException e) {
+    }
+    return null;
   }
 
   @Override
@@ -89,26 +95,31 @@ public class CertificateClientTestImpl implements CertificateClient {
   }
 
   @Override
-  public byte[] signDataStream(InputStream stream, String component)
+  public byte[] signDataStream(InputStream stream)
       throws CertificateException {
     return new byte[0];
   }
 
   @Override
+  public byte[] signData(byte[] data) throws CertificateException {
+    return new byte[0];
+  }
+
+  @Override
   public boolean verifySignature(InputStream stream, byte[] signature,
-      X509Certificate x509Certificate) {
+      X509Certificate x509Certificate) throws CertificateException {
     return true;
   }
 
   @Override
   public boolean verifySignature(byte[] data, byte[] signature,
-      X509Certificate x509Certificate) {
+      X509Certificate x509Certificate) throws CertificateException {
     return true;
   }
 
   @Override
   public CertificateSignRequest.Builder getCSRBuilder() {
-    return null;
+    return new CertificateSignRequest.Builder();
   }
 
   @Override
@@ -117,32 +128,30 @@ public class CertificateClientTestImpl implements CertificateClient {
   }
 
   @Override
-  public void storePrivateKey(PrivateKey key, String component)
+  public void storeCertificate(X509Certificate certificate)
+      throws CertificateException {
+
+  }
+
+  /**
+   * Stores the trusted chain of certificates for a specific component.
+   *
+   * @param keyStore - Cert Store.
+   * @throws CertificateException - on Error.
+   */
+  @Override
+  public void storeTrustChain(CertStore keyStore) throws CertificateException {
+
+  }
+
+  @Override
+  public void storeTrustChain(List<X509Certificate> certificates)
       throws CertificateException {
 
   }
 
   @Override
-  public void storePublicKey(PublicKey key, String component)
-      throws CertificateException {
-
-  }
-
-  @Override
-  public void storeCertificate(X509Certificate certificate, String component)
-      throws CertificateException {
-
-  }
-
-  @Override
-  public void storeTrustChain(CertStore certStore, String component)
-      throws CertificateException {
-
-  }
-
-  @Override
-  public void storeTrustChain(List<X509Certificate> certificates,
-      String component) throws CertificateException {
-
+  public InitResponse init() throws CertificateException {
+    return null;
   }
 }

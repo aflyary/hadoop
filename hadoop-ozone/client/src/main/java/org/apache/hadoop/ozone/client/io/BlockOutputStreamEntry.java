@@ -17,32 +17,35 @@
  */
 package org.apache.hadoop.ozone.client.io;
 
+import java.io.IOException;
+import java.io.OutputStream;
+
 import org.apache.hadoop.hdds.client.BlockID;
+import org.apache.hadoop.hdds.protocol.DatanodeDetails;
+import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos
+    .ChecksumType;
 import org.apache.hadoop.hdds.scm.XceiverClientManager;
-import org.apache.hadoop.hdds.scm.XceiverClientSpi;
 import org.apache.hadoop.hdds.scm.pipeline.Pipeline;
 import org.apache.hadoop.hdds.scm.storage.BlockOutputStream;
+import org.apache.hadoop.hdds.scm.storage.BufferPool;
 import org.apache.hadoop.hdds.security.token.OzoneBlockTokenIdentifier;
-import org.apache.hadoop.ozone.common.Checksum;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.nio.ByteBuffer;
-import java.util.List;
+import java.util.Collection;
 
 /**
  * Helper class used inside {@link BlockOutputStream}.
  * */
-public class BlockOutputStreamEntry extends OutputStream {
+public final class BlockOutputStreamEntry extends OutputStream {
 
   private OutputStream outputStream;
   private BlockID blockID;
   private final String key;
   private final XceiverClientManager xceiverClientManager;
   private final Pipeline pipeline;
-  private final Checksum checksum;
+  private final ChecksumType checksumType;
+  private final int bytesPerChecksum;
   private final String requestId;
   private final int chunkSize;
   // total number of bytes that should be written to this stream
@@ -54,13 +57,15 @@ public class BlockOutputStreamEntry extends OutputStream {
   private final long streamBufferFlushSize;
   private final long streamBufferMaxSize;
   private final long watchTimeout;
-  private List<ByteBuffer> bufferList;
+  private BufferPool bufferPool;
 
+  @SuppressWarnings("parameternumber")
   private BlockOutputStreamEntry(BlockID blockID, String key,
       XceiverClientManager xceiverClientManager,
       Pipeline pipeline, String requestId, int chunkSize,
       long length, long streamBufferFlushSize, long streamBufferMaxSize,
-      long watchTimeout, List<ByteBuffer> bufferList, Checksum checksum,
+      long watchTimeout, BufferPool bufferPool,
+      ChecksumType checksumType, int bytesPerChecksum,
       Token<OzoneBlockTokenIdentifier> token) {
     this.outputStream = null;
     this.blockID = blockID;
@@ -75,8 +80,9 @@ public class BlockOutputStreamEntry extends OutputStream {
     this.streamBufferFlushSize = streamBufferFlushSize;
     this.streamBufferMaxSize = streamBufferMaxSize;
     this.watchTimeout = watchTimeout;
-    this.bufferList = bufferList;
-    this.checksum = checksum;
+    this.bufferPool = bufferPool;
+    this.checksumType = checksumType;
+    this.bytesPerChecksum = bytesPerChecksum;
   }
 
   long getLength() {
@@ -105,7 +111,8 @@ public class BlockOutputStreamEntry extends OutputStream {
       this.outputStream =
           new BlockOutputStream(blockID, key, xceiverClientManager,
               pipeline, requestId, chunkSize, streamBufferFlushSize,
-              streamBufferMaxSize, watchTimeout, bufferList, checksum);
+              streamBufferMaxSize, watchTimeout, bufferPool, checksumType,
+              bytesPerChecksum);
     }
   }
 
@@ -137,56 +144,56 @@ public class BlockOutputStreamEntry extends OutputStream {
       this.outputStream.close();
       // after closing the chunkOutPutStream, blockId would have been
       // reconstructed with updated bcsId
-      if (this.outputStream instanceof BlockOutputStream) {
-        this.blockID = ((BlockOutputStream) outputStream).getBlockID();
-      }
+      this.blockID = ((BlockOutputStream) outputStream).getBlockID();
     }
   }
 
   long getTotalSuccessfulFlushedData() throws IOException {
-    if (this.outputStream instanceof BlockOutputStream) {
+    if (outputStream != null) {
       BlockOutputStream out = (BlockOutputStream) this.outputStream;
       blockID = out.getBlockID();
       return out.getTotalSuccessfulFlushedData();
-    } else if (outputStream == null) {
-        // For a pre allocated block for which no write has been initiated,
-        // the OutputStream will be null here.
-        // In such cases, the default blockCommitSequenceId will be 0
-        return 0;
-    }
-    throw new IOException("Invalid Output Stream for Key: " + key);
-  }
-
-  long getWrittenDataLength() throws IOException {
-    if (this.outputStream instanceof BlockOutputStream) {
-      BlockOutputStream out = (BlockOutputStream) this.outputStream;
-      return out.getWrittenDataLength();
-    } else if (outputStream == null) {
+    } else {
       // For a pre allocated block for which no write has been initiated,
       // the OutputStream will be null here.
       // In such cases, the default blockCommitSequenceId will be 0
       return 0;
     }
-    throw new IOException("Invalid Output Stream for Key: " + key);
+  }
+
+  Collection<DatanodeDetails> getFailedServers() throws IOException {
+    if (outputStream != null) {
+      BlockOutputStream out = (BlockOutputStream) this.outputStream;
+      return out.getFailedServers();
+    }
+    return null;
+  }
+
+  long getWrittenDataLength() throws IOException {
+    if (outputStream != null) {
+      BlockOutputStream out = (BlockOutputStream) this.outputStream;
+      return out.getWrittenDataLength();
+    } else {
+      // For a pre allocated block for which no write has been initiated,
+      // the OutputStream will be null here.
+      // In such cases, the default blockCommitSequenceId will be 0
+      return 0;
+    }
   }
 
   void cleanup(boolean invalidateClient) throws IOException {
     checkStream();
-    if (this.outputStream instanceof BlockOutputStream) {
-      BlockOutputStream out = (BlockOutputStream) this.outputStream;
-      out.cleanup(invalidateClient);
-    }
+    BlockOutputStream out = (BlockOutputStream) this.outputStream;
+    out.cleanup(invalidateClient);
+
   }
 
   void writeOnRetry(long len) throws IOException {
     checkStream();
-    if (this.outputStream instanceof BlockOutputStream) {
-      BlockOutputStream out = (BlockOutputStream) this.outputStream;
-      out.writeOnRetry(len);
-      this.currentPosition += len;
-    } else {
-      throw new IOException("Invalid Output Stream for Key: " + key);
-    }
+    BlockOutputStream out = (BlockOutputStream) this.outputStream;
+    out.writeOnRetry(len);
+    this.currentPosition += len;
+
   }
 
   /**
@@ -204,12 +211,18 @@ public class BlockOutputStreamEntry extends OutputStream {
     private long streamBufferFlushSize;
     private long streamBufferMaxSize;
     private long watchTimeout;
-    private List<ByteBuffer> bufferList;
+    private BufferPool bufferPool;
     private Token<OzoneBlockTokenIdentifier> token;
-    private Checksum checksum;
+    private ChecksumType checksumType;
+    private int bytesPerChecksum;
 
-    public Builder setChecksum(Checksum cs) {
-      this.checksum = cs;
+    public Builder setChecksumType(ChecksumType type) {
+      this.checksumType = type;
+      return this;
+    }
+
+    public Builder setBytesPerChecksum(int bytes) {
+      this.bytesPerChecksum = bytes;
       return this;
     }
 
@@ -229,8 +242,8 @@ public class BlockOutputStreamEntry extends OutputStream {
       return this;
     }
 
-    public Builder setPipeline(Pipeline pipeline) {
-      this.pipeline = pipeline;
+    public Builder setPipeline(Pipeline ppln) {
+      this.pipeline = ppln;
       return this;
     }
 
@@ -264,8 +277,8 @@ public class BlockOutputStreamEntry extends OutputStream {
       return this;
     }
 
-    public Builder setBufferList(List<ByteBuffer> bufferList) {
-      this.bufferList = bufferList;
+    public Builder setbufferPool(BufferPool pool) {
+      this.bufferPool = pool;
       return this;
     }
 
@@ -278,7 +291,7 @@ public class BlockOutputStreamEntry extends OutputStream {
       return new BlockOutputStreamEntry(blockID, key,
           xceiverClientManager, pipeline, requestId, chunkSize,
           length, streamBufferFlushSize, streamBufferMaxSize, watchTimeout,
-          bufferList, checksum, token);
+          bufferPool, checksumType, bytesPerChecksum, token);
     }
   }
 
@@ -300,10 +313,6 @@ public class BlockOutputStreamEntry extends OutputStream {
 
   public Pipeline getPipeline() {
     return pipeline;
-  }
-
-  public Checksum getChecksum() {
-    return checksum;
   }
 
   public String getRequestId() {
@@ -330,8 +339,8 @@ public class BlockOutputStreamEntry extends OutputStream {
     return watchTimeout;
   }
 
-  public List<ByteBuffer> getBufferList() {
-    return bufferList;
+  public BufferPool getBufferPool() {
+    return bufferPool;
   }
 
   public void setCurrentPosition(long curPosition) {
